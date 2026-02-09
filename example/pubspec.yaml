@@ -1,0 +1,23 @@
+name: metric_athlete_pod_ble_example
+description: Example app for metric_athlete_pod_ble plugin
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.6 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  metric_athlete_pod_ble:
+    path: ../
+  flutter_riverpod: ^2.5.1
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-set(PROJECT_NAME "pod_connector")
+set(PROJECT_NAME "metric_athlete_pod_ble")
 project(${PROJECT_NAME} LANGUAGES CXX)
 
 # C++17 required for WinRT coroutines (co_await)
@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This value is used when generating builds using this plugin, so it must
 # not be changed
-set(PLUGIN_NAME "pod_connector_plugin")
+set(PLUGIN_NAME "metric_athlete_pod_ble_plugin")
 
 add_library(${PLUGIN_NAME} SHARED
   "pod_connector_plugin.cpp"
@@ -34,7 +34,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
 )
 
 # List of absolute paths to libraries that should be bundled with the plugin
-set(pod_connector_bundled_libraries
+set(metric_athlete_pod_ble_bundled_libraries
   ""
   PARENT_SCOPE
 )

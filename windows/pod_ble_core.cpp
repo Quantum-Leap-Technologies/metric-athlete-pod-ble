@@ -3,6 +3,7 @@
 #include <winrt/Windows.Security.Cryptography.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <iomanip>
 
@@ -70,7 +71,8 @@ void PodBLECore::OnAdvertisementReceived(
 
     // Filter for POD devices
     std::string upperName = localName;
-    std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+    std::transform(upperName.begin(), upperName.end(), upperName.begin(),
+        [](unsigned char c) -> char { return static_cast<char>(std::toupper(c)); });
     if (upperName.find("POD") != 0) return;
 
     // Format BLE address as string
@@ -227,7 +229,7 @@ void PodBLECore::DownloadFile(const std::string& filename, int64_t start, int64_
     command[0] = 0x06;
     command[1] = 0x20;
     size_t copyLen = std::min(cleanName.size(), size_t(32));
-    std::copy(cleanName.begin(), cleanName.begin() + copyLen, command.begin() + 2);
+    std::memcpy(command.data() + 2, cleanName.data(), copyLen);
 
     WriteCommand(command);
 

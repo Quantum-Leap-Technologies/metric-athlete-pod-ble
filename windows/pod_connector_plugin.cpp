@@ -11,6 +11,16 @@
 
 namespace pod_connector {
 
+namespace {
+// Flutter's StandardMethodCodec encodes Dart int as either int32_t or int64_t
+// depending on the value's magnitude. This helper extracts either variant safely.
+int GetIntFromEncodableValue(const flutter::EncodableValue& value, int fallback) {
+    if (auto* i32 = std::get_if<int32_t>(&value)) return static_cast<int>(*i32);
+    if (auto* i64 = std::get_if<int64_t>(&value)) return static_cast<int>(*i64);
+    return fallback;
+}
+}  // namespace
+
 // static
 void PodConnectorPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
@@ -138,8 +148,8 @@ void PodConnectorPlugin::HandleMethodCall(
 
             if (start_it != args->end()) start = std::get<int64_t>(start_it->second);
             if (end_it != args->end()) end = std::get<int64_t>(end_it->second);
-            if (total_it != args->end()) totalFiles = std::get<int32_t>(total_it->second);
-            if (index_it != args->end()) currentIndex = std::get<int32_t>(index_it->second);
+            if (total_it != args->end()) totalFiles = GetIntFromEncodableValue(total_it->second, 1);
+            if (index_it != args->end()) currentIndex = GetIntFromEncodableValue(index_it->second, 1);
 
             ble_core_->DownloadFile(filename, start, end, totalFiles, currentIndex);
             result->Success();

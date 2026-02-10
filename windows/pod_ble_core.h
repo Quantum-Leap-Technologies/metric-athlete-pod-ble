@@ -41,7 +41,7 @@ public:
     void StopScan();
     void Connect(const std::string& deviceAddress);
     void Disconnect();
-    void WriteCommand(const std::vector<uint8_t>& data);
+    winrt::fire_and_forget WriteCommand(const std::vector<uint8_t>& data);
     void DownloadFile(const std::string& filename, int64_t start, int64_t end,
                       int totalFiles, int currentIndex);
     void CancelDownload();
@@ -81,6 +81,9 @@ private:
     std::thread watchdog_thread_;
     std::chrono::steady_clock::time_point last_packet_time_;
     std::mutex mtx_;
+
+    // Lifetime guard: shared flag checked by detached threads before using `this`
+    std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
 
     // Sleep prevention
     void PreventSleep();

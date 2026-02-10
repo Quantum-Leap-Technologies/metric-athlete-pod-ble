@@ -1,4 +1,10 @@
 #include "pod_ble_core.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <winrt/Windows.Security.Cryptography.h>
 #include <algorithm>
 #include <cmath>
@@ -18,6 +24,7 @@ const winrt::guid PodBLECore::WRITE_CHAR_UUID{0xFB4A9352, 0x9BCD, 0x4CC6,
 PodBLECore::PodBLECore() {}
 
 PodBLECore::~PodBLECore() {
+    alive_->store(false);
     StopWatchdog();
     Disconnect();
     AllowSleep();
@@ -44,9 +51,9 @@ void PodBLECore::StartScan() {
     if (on_status_) on_status_("Scanning...");
 
     // Auto-stop after 15 seconds
-    std::thread([this]() {
+    std::thread([this, alive = alive_]() {
         std::this_thread::sleep_for(std::chrono::seconds(15));
-        StopScan();
+        if (alive->load()) StopScan();
     }).detach();
 }
 
@@ -188,8 +195,8 @@ void PodBLECore::Disconnect() {
 
 // MARK: - Write
 
-void PodBLECore::WriteCommand(const std::vector<uint8_t>& data) {
-    if (write_char_ == nullptr) return;
+winrt::fire_and_forget PodBLECore::WriteCommand(const std::vector<uint8_t>& data) {
+    if (write_char_ == nullptr) co_return;
 
     try {
         DataWriter writer;
@@ -197,8 +204,7 @@ void PodBLECore::WriteCommand(const std::vector<uint8_t>& data) {
         writer.WriteBytes(data);
         auto buffer = writer.DetachBuffer();
 
-        // Fire and forget async write
-        write_char_.WriteValueAsync(buffer, GattWriteOption::WriteWithResponse);
+        co_await write_char_.WriteValueAsync(buffer, GattWriteOption::WriteWithResponse);
     } catch (...) {}
 }
 
@@ -240,9 +246,9 @@ void PodBLECore::CancelDownload() {
     ResetDownloadState();
 
     // Send skip signal
-    std::thread([this]() {
+    std::thread([this, alive = alive_]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(600));
-        if (on_payload_) on_payload_({0xDA});
+        if (alive->load() && on_payload_) on_payload_({0xDA});
     }).detach();
 }
 
@@ -292,9 +298,9 @@ void PodBLECore::ProcessPacket(const std::vector<uint8_t>& packet) {
 
     // Completion check
     if (total_expected_packets_ > 0 && received_packet_count_ >= total_expected_packets_) {
-        std::thread([this]() {
+        std::thread([this, alive = alive_]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            FinishMessage();
+            if (alive->load()) FinishMessage();
         }).detach();
     }
 }

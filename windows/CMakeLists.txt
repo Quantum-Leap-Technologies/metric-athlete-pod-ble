@@ -19,6 +19,10 @@ add_library(${PLUGIN_NAME} SHARED
 
 apply_standard_settings(${PLUGIN_NAME})
 
+# The host app's apply_standard_settings defines _HAS_EXCEPTIONS=0, but this
+# plugin requires C++ exceptions for WinRT coroutines and error handling.
+target_compile_definitions(${PLUGIN_NAME} PRIVATE _HAS_EXCEPTIONS=1)
+
 set_target_properties(${PLUGIN_NAME} PROPERTIES
   CXX_VISIBILITY_PRESET hidden)
 
@@ -31,6 +35,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   flutter_wrapper_plugin
   windowsapp
+  kernel32
 )
 
 # List of absolute paths to libraries that should be bundled with the plugin

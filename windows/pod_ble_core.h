@@ -1,5 +1,9 @@
 #pragma once
 
+// Include <windows.h> before C++/WinRT headers to ensure the full Win32 API
+// surface (SetThreadExecutionState, ES_CONTINUOUS, etc.) is available.
+#include <windows.h>
+
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Bluetooth.h>

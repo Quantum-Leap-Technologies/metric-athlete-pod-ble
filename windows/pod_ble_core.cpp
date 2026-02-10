@@ -1,10 +1,5 @@
 #include "pod_ble_core.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include <winrt/Windows.Security.Cryptography.h>
 #include <algorithm>
 #include <cmath>

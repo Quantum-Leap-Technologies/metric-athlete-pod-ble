@@ -2,10 +2,6 @@ cmake_minimum_required(VERSION 3.14)
 set(PROJECT_NAME "metric_athlete_pod_ble")
 project(${PROJECT_NAME} LANGUAGES CXX)
 
-# C++17 required for WinRT coroutines (co_await)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 # This value is used when generating builds using this plugin, so it must
 # not be changed
 set(PLUGIN_NAME "metric_athlete_pod_ble_plugin")
@@ -19,12 +15,17 @@ add_library(${PLUGIN_NAME} SHARED
 
 apply_standard_settings(${PLUGIN_NAME})
 
+# C++20 required for standard coroutine support (co_await/co_return).
+# Set per-target AFTER apply_standard_settings to override its C++17 default.
+set_target_properties(${PLUGIN_NAME} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_VISIBILITY_PRESET hidden
+)
+
 # The host app's apply_standard_settings defines _HAS_EXCEPTIONS=0, but this
 # plugin requires C++ exceptions for WinRT coroutines and error handling.
 target_compile_definitions(${PLUGIN_NAME} PRIVATE _HAS_EXCEPTIONS=1)
-
-set_target_properties(${PLUGIN_NAME} PROPERTIES
-  CXX_VISIBILITY_PRESET hidden)
 
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
 

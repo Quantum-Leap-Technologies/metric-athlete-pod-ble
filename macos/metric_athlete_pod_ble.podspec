@@ -15,7 +15,7 @@ Flutter plugin for communicating with Pod GPS/IMU devices over Bluetooth Low Ene
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
   s.dependency 'FlutterMacOS'
-  s.platform = :osx, '11.0'
+  s.platform = :osx, '10.15'
   s.osx.frameworks = 'CoreBluetooth'
 
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }

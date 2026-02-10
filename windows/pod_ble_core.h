@@ -2,6 +2,10 @@
 
 // Include <windows.h> before C++/WinRT headers to ensure the full Win32 API
 // surface (SetThreadExecutionState, ES_CONTINUOUS, etc.) is available.
+// NOMINMAX prevents min/max macros from conflicting with std::min/std::max.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <winrt/Windows.Foundation.h>

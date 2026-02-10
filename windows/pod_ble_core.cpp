@@ -167,7 +167,7 @@ winrt::fire_and_forget PodBLECore::ConnectAsync(uint64_t address) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         WriteCommand({0x08});
 
-    } catch (const winrt::hresult_error& ex) {
+    } catch (const winrt::hresult_error&) {
         if (on_status_) on_status_("Connection Error");
     }
 }

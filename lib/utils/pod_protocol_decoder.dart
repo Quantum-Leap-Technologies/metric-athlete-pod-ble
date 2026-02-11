@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
-import 'package:metric_athlete_pod_ble/utils/trajectory_filter.dart';
 
 ///Helper class used to transfer messages between the [PodProtocolHandler] and the [podNotifier].
 ///The [type] contains the message type received from the pod.
@@ -40,15 +39,19 @@ class PodProtocolHandler {
     switch (type) {
       case 0x01: //Live data steaming
       try {
-        //transforms the payload to a LiveTelemerty object, updates the description and returns the object to the notifier.
-           final telemetry = LiveTelemetry.fromBytes(payload); 
-           onMessageDecoded(PodMessage(
-             0x01, 
-             "Live Update", 
-             payload: telemetry //live telemetry object
-           ));
+        //transforms the payload to a LiveTelemetry object, updates the description and returns the object to the notifier.
+           final telemetry = LiveTelemetry.fromBytes(payload);
+           if (telemetry != null) {
+             onMessageDecoded(PodMessage(
+               0x01,
+               "Live Update",
+               payload: telemetry //live telemetry object
+             ));
+           } else {
+             PodLogger.warn('protocol', 'Truncated telemetry packet', detail: '${payload.length} bytes, need 72');
+           }
         } catch (e) {
-           debugPrint("⚠️ Telemetry Parse Error: $e");
+           PodLogger.error('protocol', 'Telemetry parse error', detail: '$e');
         }
         break;
 
@@ -77,26 +80,23 @@ class PodProtocolHandler {
   }
 
   
-  ///Helper function to process the downloaded bytes into usable data.
-  ///The function receives the raw bytes and returns a filtered list of [SensorLog] objects.
+  ///Helper function to parse the downloaded bytes into raw [SensorLog] objects.
   ///The payload is in the format described by the [BinaryParser].
-  void _handleFileDownload(Uint8List rawBytes) async {
-
+  ///Filtering is NOT done here — it is handled by the notifier to avoid double-filtering.
+  void _handleFileDownload(Uint8List rawBytes) {
     try {
-      // 1. Parse Binary
-      final rawLogs = BinaryParser.parseBytes(rawBytes); 
-      
-      // 2. Filter Noise (Trajectory)
-      final cleanLogs = await compute(TrajectoryFilter.process,rawLogs);
+      // Parse binary data into raw SensorLog objects
+      final rawLogs = BinaryParser.parseBytes(rawBytes);
 
-      // 3. Return CLEAN List<SensorLog> to Notifier
+      // Return raw List<SensorLog> to Notifier (filtering happens there)
       onMessageDecoded(PodMessage(
-        0x03, 
-        "Download Complete", 
-        payload: cleanLogs.logs
+        0x03,
+        "Download Complete",
+        payload: rawLogs
       ));
     } catch (e) {
-      // Send empty list to signal failure and a parse Failed description.
+      PodLogger.error('protocol', 'Binary parse error', detail: '$e');
+      // Send empty list to signal failure
       onMessageDecoded(PodMessage(0x03, "Parse Failed", payload: <SensorLog>[]));
     }
   }
@@ -181,7 +181,7 @@ class PodProtocolHandler {
       
       onMessageDecoded(PodMessage(0x02, "Found $fileCount Files", payload: fileSummaries));
     } catch (e) {
-      debugPrint("Error decoding file list: $e");
+      PodLogger.error('protocol', 'Error decoding file list', detail: '$e');
     }
   }
 }

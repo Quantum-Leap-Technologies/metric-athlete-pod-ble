@@ -77,20 +77,46 @@ class TrajectoryFilter {
     final List<SensorLog> sortedLogs = List.from(cleanLogs)
       ..sort((a, b) => a.packetId.compareTo(b.packetId));
 
+    // 1b. Deduplicate by PacketID (keep last occurrence, as later readings
+    // are more likely to be correct after sensor stabilization).
+    // Duplicate IDs produce zero-distance segments that deflate speed calculations.
+    final List<SensorLog> dedupedLogs = [];
+    for (int i = 0; i < sortedLogs.length; i++) {
+      if (i + 1 < sortedLogs.length && sortedLogs[i].packetId == sortedLogs[i + 1].packetId) {
+        continue; // Skip this one, keep the next
+      }
+      dedupedLogs.add(sortedLogs[i]);
+    }
+
     // 2. Determine Kernel Step Size (Hardware Median)
     // The hardware might step by 1, 10, or 100 counts per log.
-    // We scan the first 20 packets to find the median difference, establishing
-    // the "True Step Size" for this specific device firmware.
+    // We sample up to 50 consecutive diffs and apply IQR outlier rejection
+    // to handle corrupted packets or irregular spacing after power-on.
     int kernelStepSize = 100; // Default fallback
-    if (sortedLogs.length >= 20) {
+    final int sampleSize = min(dedupedLogs.length, 51); // Need at least 2 for 1 diff
+    if (sampleSize >= 2) {
       List<int> diffs = [];
-      for (int i = 1; i < 20; i++) {
-        int d = sortedLogs[i].packetId - sortedLogs[i - 1].packetId;
-        if (d > 0 && d < 5000) diffs.add(d); 
+      for (int i = 1; i < sampleSize; i++) {
+        int d = dedupedLogs[i].packetId - dedupedLogs[i - 1].packetId;
+        if (d > 0 && d < 5000) diffs.add(d);
       }
-      if (diffs.isNotEmpty) {
+      if (diffs.length >= 3) {
         diffs.sort();
-        kernelStepSize = diffs[diffs.length ~/ 2]; // Median
+        // IQR outlier rejection
+        final q1 = diffs[diffs.length ~/ 4];
+        final q3 = diffs[(diffs.length * 3) ~/ 4];
+        final iqr = q3 - q1;
+        final lowerBound = q1 - 1.5 * iqr;
+        final upperBound = q3 + 1.5 * iqr;
+        final filtered = diffs.where((d) => d >= lowerBound && d <= upperBound).toList();
+        if (filtered.isNotEmpty) {
+          kernelStepSize = filtered[filtered.length ~/ 2]; // Median of inliers
+        } else {
+          kernelStepSize = diffs[diffs.length ~/ 2]; // Fallback to raw median
+        }
+      } else if (diffs.isNotEmpty) {
+        diffs.sort();
+        kernelStepSize = diffs[diffs.length ~/ 2];
       }
     }
 
@@ -100,12 +126,12 @@ class TrajectoryFilter {
     int repairedCount = 0; // NEW: Track how many packets we had to fake.
 
     // Anchor: Start with the first clean log
-    DateTime currentTime = sortedLogs.first.timestamp;
-    repairedLogs.add(sortedLogs.first.copyWith(timestamp: currentTime));
+    DateTime currentTime = dedupedLogs.first.timestamp;
+    repairedLogs.add(dedupedLogs.first.copyWith(timestamp: currentTime));
 
-    for (int i = 1; i < sortedLogs.length; i++) {
-      final prev = sortedLogs[i - 1];
-      final curr = sortedLogs[i];
+    for (int i = 1; i < dedupedLogs.length; i++) {
+      final prev = dedupedLogs[i - 1];
+      final curr = dedupedLogs[i];
       
       // Calculate how many "steps" the hardware skipped.
       // E.g., if IDs are 100 and 300, and step is 100, we missed 1 step (ID 200).

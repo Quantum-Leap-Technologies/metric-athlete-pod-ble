@@ -38,7 +38,18 @@ class PodState {
 
 
   ///This holds the raw lists of data of a downloaded session.
-  final List<List<SensorLog>> rawClusters; 
+  final List<List<SensorLog>> rawClusters;
+
+  // --- Signal Quality ---
+  /// Last known RSSI (Received Signal Strength Indicator) in dBm.
+  /// Null if no RSSI has been received yet.
+  final int? lastRssi;
+
+  // --- Clock Drift ---
+  /// Estimated clock drift between pod RTC and device system clock, in milliseconds.
+  /// Positive means pod clock is ahead of device clock.
+  /// Null if no drift measurement has been taken.
+  final int? clockDriftMs;
 
   PodState({
     this.isScanning = false,
@@ -54,6 +65,8 @@ class PodState {
     this.settingsPlayerNumber = 0,
     this.settingsLogInterval = 100, // Default 10Hz
     this.rawClusters = const [], // Default empty
+    this.lastRssi,
+    this.clockDriftMs,
   });
   ///Creates a copy of the object with its values.
   ///Crucial to let the notifier know there was an update to the object.
@@ -61,6 +74,7 @@ class PodState {
     bool? isScanning,
     List<Map<String, dynamic>>? scannedDevices,
     String? connectedDeviceId,
+    bool clearConnectedDeviceId = false,
     String? statusMessage,
     List<String>? podFiles,
     List<int>? downloadedFileBytes,
@@ -71,11 +85,13 @@ class PodState {
     int? settingsPlayerNumber,
     int? settingsLogInterval,
     List<List<SensorLog>>? rawClusters,
+    int? lastRssi,
+    int? clockDriftMs,
   }) {
     return PodState(
       isScanning: isScanning ?? this.isScanning,
       scannedDevices: scannedDevices ?? this.scannedDevices,
-      connectedDeviceId: connectedDeviceId ?? this.connectedDeviceId,
+      connectedDeviceId: clearConnectedDeviceId ? null : (connectedDeviceId ?? this.connectedDeviceId),
       statusMessage: statusMessage ?? this.statusMessage,
       podFiles: podFiles ?? this.podFiles,
       downloadedFileBytes: downloadedFileBytes ?? this.downloadedFileBytes,
@@ -86,6 +102,8 @@ class PodState {
       settingsPlayerNumber: settingsPlayerNumber ?? this.settingsPlayerNumber,
       settingsLogInterval: settingsLogInterval ?? this.settingsLogInterval,
       rawClusters: rawClusters ?? this.rawClusters,
+      lastRssi: lastRssi ?? this.lastRssi,
+      clockDriftMs: clockDriftMs ?? this.clockDriftMs,
     );
   }
 }

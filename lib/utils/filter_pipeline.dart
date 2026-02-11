@@ -172,24 +172,34 @@ class FilterPipeline {
   /// If the Haversine distance between consecutive points exceeds
   /// [maxGpsJumpMeters] in a single 100ms interval, replace the GPS position
   /// with the speed-inferred position.
+  ///
+  /// Compares against last *accepted* (non-corrected) position to prevent
+  /// correction cascade drift. Limits consecutive corrections to 3 before
+  /// re-anchoring to the raw GPS position.
   static (List<SensorLog>, int) _applyOutlierRejection(
       List<SensorLog> logs, FilterConfig config) {
     final List<SensorLog> corrected = [logs[0]];
     int corrections = 0;
+    int consecutiveCorrections = 0;
+    // Track last accepted (non-corrected) position for comparison
+    double lastAcceptedLat = logs[0].latitude;
+    double lastAcceptedLon = logs[0].longitude;
 
     for (int i = 1; i < logs.length; i++) {
       final prev = corrected.last;
       final curr = logs[i];
 
+      // Compare against last accepted position to prevent cascade drift
       double distance = _haversine(
-        prev.latitude, prev.longitude,
+        lastAcceptedLat, lastAcceptedLon,
         curr.latitude, curr.longitude,
       );
 
       double timeDiffSec =
           curr.timestamp.difference(prev.timestamp).inMilliseconds / 1000.0;
 
-      if (timeDiffSec > 0 &&
+      if (consecutiveCorrections < 3 &&
+          timeDiffSec > 0 &&
           timeDiffSec <= 0.15 &&
           distance > config.maxGpsJumpMeters) {
         // Use speed-inferred distance instead of GPS jump
@@ -198,9 +208,13 @@ class FilterPipeline {
         double expectedDist = avgSpeedMs * timeDiffSec;
 
         if (expectedDist < distance) {
-          // Interpolate position based on expected distance
+          // Interpolate position based on expected distance from previous output
+          double distFromPrev = _haversine(
+            prev.latitude, prev.longitude,
+            curr.latitude, curr.longitude,
+          );
           double ratio =
-              distance > 0 ? expectedDist / distance : 0;
+              distFromPrev > 0 ? expectedDist / distFromPrev : 0;
           double newLat = prev.latitude +
               (curr.latitude - prev.latitude) * ratio;
           double newLon = prev.longitude +
@@ -211,11 +225,16 @@ class FilterPipeline {
             longitude: newLon,
           ));
           corrections++;
+          consecutiveCorrections++;
           continue;
         }
       }
 
+      // Accept this position as the new anchor
       corrected.add(curr);
+      lastAcceptedLat = curr.latitude;
+      lastAcceptedLon = curr.longitude;
+      consecutiveCorrections = 0;
     }
 
     return (corrected, corrections);

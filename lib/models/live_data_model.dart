@@ -82,7 +82,9 @@ class LiveTelemetry {
   });
   ///Supply a full packet of live data streamed from the pod and transforms it into a LiveTelemetry object.
   ///The function uses little Endian decoding as specified in pod documents.
-  factory LiveTelemetry.fromBytes(Uint8List bytes) {
+  ///Returns null if the packet is truncated (less than 72 bytes).
+  static LiveTelemetry? fromBytes(Uint8List bytes) {
+    if (bytes.length < 72) return null;
     final view = ByteData.sublistView(bytes);
     
     double getFloat(int offset) => view.getFloat32(offset, Endian.little);

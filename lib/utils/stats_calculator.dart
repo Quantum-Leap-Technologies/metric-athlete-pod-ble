@@ -346,10 +346,16 @@ class StatsCalculator {
 
   // --- HELPERS ---
 
+  /// Resamples to 1Hz by binning samples per calendar second.
+  /// Within each 1-second bin:
+  /// - Position: uses the mean lat/lon (best for distance calculation)
+  /// - Speed: uses the max speed (preserves peak speed for top speed tracking)
+  /// - IMU: uses the sample with max G-force (preserves peak impacts)
   static List<SensorLog> _resampleTo1Hz(List<SensorLog> logs) {
     if (logs.isEmpty) return [];
     List<SensorLog> resampled = [];
-    DateTime? lastSecond;
+    List<SensorLog> bin = [];
+    DateTime? binSecond;
 
     for (var log in logs) {
       DateTime currentSecond = DateTime(
@@ -357,12 +363,58 @@ class StatsCalculator {
         log.timestamp.hour, log.timestamp.minute, log.timestamp.second,
       );
 
-      if (lastSecond == null || currentSecond.isAfter(lastSecond)) {
-        resampled.add(log);
-        lastSecond = currentSecond;
+      if (binSecond == null || currentSecond == binSecond) {
+        bin.add(log);
+        binSecond = currentSecond;
+      } else {
+        // Flush previous bin
+        if (bin.isNotEmpty) {
+          resampled.add(_aggregateBin(bin));
+        }
+        bin = [log];
+        binSecond = currentSecond;
       }
     }
+    // Flush final bin
+    if (bin.isNotEmpty) {
+      resampled.add(_aggregateBin(bin));
+    }
     return resampled;
+  }
+
+  /// Aggregates a 1-second bin of samples into a single representative sample.
+  static SensorLog _aggregateBin(List<SensorLog> bin) {
+    if (bin.length == 1) return bin.first;
+
+    // Position: mean for smooth distance calculation
+    double meanLat = 0, meanLon = 0;
+    double maxSpeed = 0;
+    // Track the sample with highest filtered accel magnitude for impact preservation
+    SensorLog bestImu = bin.first;
+    double bestG = 0;
+
+    for (var log in bin) {
+      meanLat += log.latitude;
+      meanLon += log.longitude;
+      if (log.speed > maxSpeed) maxSpeed = log.speed;
+      double g = sqrt(log.filteredAccelX * log.filteredAccelX +
+          log.filteredAccelY * log.filteredAccelY +
+          log.filteredAccelZ * log.filteredAccelZ);
+      if (g > bestG) {
+        bestG = g;
+        bestImu = log;
+      }
+    }
+
+    meanLat /= bin.length;
+    meanLon /= bin.length;
+
+    return bestImu.copyWith(
+      latitude: meanLat,
+      longitude: meanLon,
+      speed: maxSpeed,
+      timestamp: bin.first.timestamp,
+    );
   }
 
   static List<double> _applySmoothing(List<double> rawSpeeds) {

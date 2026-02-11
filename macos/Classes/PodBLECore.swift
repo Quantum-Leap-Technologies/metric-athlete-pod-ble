@@ -109,33 +109,43 @@ class PodBLECore: NSObject {
             return
         }
 
-        let peripherals = centralManager.retrievePeripherals(withIdentifiers: [uuid])
-        guard let peripheral = peripherals.first else {
-            delegate?.didUpdateStatus("Device Not Found")
-            return
-        }
+        // All CoreBluetooth operations must happen on bleQueue
+        bleQueue.async { [weak self] in
+            guard let self = self else { return }
+            let peripherals = self.centralManager.retrievePeripherals(withIdentifiers: [uuid])
+            guard let peripheral = peripherals.first else {
+                self.delegate?.didUpdateStatus("Device Not Found")
+                return
+            }
 
-        connectedPeripheral = peripheral
-        peripheral.delegate = self
-        centralManager.connect(peripheral, options: nil)
-        delegate?.didUpdateStatus("Connecting...")
+            self.connectedPeripheral = peripheral
+            peripheral.delegate = self
+            self.centralManager.connect(peripheral, options: nil)
+            self.delegate?.didUpdateStatus("Connecting...")
+        }
     }
 
     func disconnect() {
         stopWatchdog()
-        if let peripheral = connectedPeripheral {
-            centralManager.cancelPeripheralConnection(peripheral)
+        bleQueue.async { [weak self] in
+            guard let self = self else { return }
+            if let peripheral = self.connectedPeripheral {
+                self.centralManager.cancelPeripheralConnection(peripheral)
+            }
+            self.cleanupConnection()
+            self.delegate?.didUpdateStatus("Disconnected")
         }
-        cleanupConnection()
-        delegate?.didUpdateStatus("Disconnected")
     }
 
     // MARK: - Write Command
 
     func writeCommand(_ data: Data) {
-        guard let peripheral = connectedPeripheral,
-              let characteristic = writeCharacteristic else { return }
-        peripheral.writeValue(data, for: characteristic, type: .withResponse)
+        bleQueue.async { [weak self] in
+            guard let self = self,
+                  let peripheral = self.connectedPeripheral,
+                  let characteristic = self.writeCharacteristic else { return }
+            peripheral.writeValue(data, for: characteristic, type: .withResponse)
+        }
     }
 
     // MARK: - Download
@@ -254,7 +264,7 @@ class PodBLECore: NSObject {
         let sec = Int(peekData[10])
 
         var calendar = Calendar.current
-        calendar.timeZone = TimeZone.current
+        calendar.timeZone = TimeZone(identifier: "UTC")!
         var components = DateComponents()
         components.year = yr
         components.month = mon

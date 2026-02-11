@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:path_provider/path_provider.dart';
@@ -88,24 +89,32 @@ class StorageService {
   ///File needs to contain at least two rows(one row of data and one row of headers).
   ///Function skips malformed rows to prevent crashes.
   ///Returns an empty list if an error occured while processing the file.
+  ///Uses streaming line-by-line reading to avoid loading the entire file into memory.
   Future<List<SensorLog>> readCsvFile(File file) async {
     try {
-      final lines = await file.readAsLines();
-      // Need at least header + 1 row
-      if (lines.length < 2) return []; 
-      
-      List<SensorLog> logs = [];
+      final List<SensorLog> logs = [];
+      bool isHeader = true;
 
-      // Start at index 1 to skip header
-      for (int i = 1; i < lines.length; i++) {
-        final row = lines[i].split(',');
-        
-        // Ensure row has the correct amount of column (SensorLog fields)
-        if (row.length < 14) continue; 
-        
+      // Stream the file line-by-line to avoid loading the entire file into memory
+      final stream = file.openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter());
+
+      await for (final line in stream) {
+        // Skip header row
+        if (isHeader) {
+          isHeader = false;
+          continue;
+        }
+
+        final row = line.split(',');
+
+        // Ensure row has the correct amount of columns (SensorLog fields)
+        if (row.length < 14) continue;
+
         try {
           logs.add(SensorLog(
-            timestamp: DateTime.parse(row[0]), 
+            timestamp: DateTime.parse(row[0]),
             packetId: int.tryParse(row[1]) ?? 0,
             latitude: double.tryParse(row[2]) ?? 0.0,
             longitude: double.tryParse(row[3]) ?? 0.0,

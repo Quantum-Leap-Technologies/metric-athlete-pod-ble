@@ -8,12 +8,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:metric_athlete_pod_ble/models/session_block_model.dart';
 
 import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
-import 'package:metric_athlete_pod_ble/utils/session_cluster.dart';
-import 'package:metric_athlete_pod_ble/utils/trajectory_filter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:metric_athlete_pod_ble/utils/pod_protocol_decoder.dart';
-import 'package:metric_athlete_pod_ble/services/storage_service.dart';
 
 /// The central State Management class for the Pod Connector application.
 /// 
@@ -81,14 +78,30 @@ class PodNotifier extends Notifier<PodState> {
       switch (msg.type) {
       
       // Live stream data
-      case 0x01: 
+      case 0x01:
         if (msg.payload is LiveTelemetry) {
           final newData = msg.payload as LiveTelemetry;
-          
+
+          // --- G3: Clock Drift Detection ---
+          // Compare pod GPS timestamp against device system clock
+          int? driftMs;
+          final podTs = newData.getTimestamp();
+          if (podTs != null && newData.isGpsFixValid) {
+            final deviceNow = DateTime.now().toUtc();
+            driftMs = podTs.difference(deviceNow).inMilliseconds;
+            // Only log significant drift (>5 seconds)
+            if (driftMs.abs() > 5000 && (state.clockDriftMs == null || (driftMs - (state.clockDriftMs ?? 0)).abs() > 1000)) {
+              PodLogger.warn('clock', 'Pod clock drift detected', detail: '${driftMs}ms');
+            }
+          }
+
           // Manage History Buffer (Keep last 200 points)
+          // Append to end (O(1) amortized) and take last 200
           final history = List<LiveTelemetry>.from(state.telemetryHistory);
-          history.insert(0, newData);
-          if (history.length > 200) history.removeLast();
+          history.add(newData);
+          final trimmed = history.length > 200
+              ? history.sublist(history.length - 200)
+              : history;
 
           //Record to buffer if the user has started a recording session
           if (state.isRecording) {
@@ -97,8 +110,9 @@ class PodNotifier extends Notifier<PodState> {
 
           state = state.copyWith(
             latestTelemetry: newData,
-            telemetryHistory: history,
+            telemetryHistory: trimmed,
             statusMessage: state.isRecording ? "Recording..." : state.statusMessage,
+            clockDriftMs: driftMs ?? state.clockDriftMs,
           );
         }
         break;
@@ -129,11 +143,10 @@ class PodNotifier extends Notifier<PodState> {
 
                // --- HEALTH CHECK ---
                if (result.healthScore < 60.0) {
-                 debugPrint("⚠️ WARNING: Poor Data Quality (Health: ${result.healthScore.toStringAsFixed(1)}%)");
-                 // Optional: You could update a specific state variable here to show a warning icon
+                 PodLogger.warn('sync', 'Poor data quality', detail: 'health=${result.healthScore.toStringAsFixed(1)}%');
                }
-               
-               debugPrint("✅ Filter Complete. Clean logs: ${result.logs.length} (Health: ${result.healthScore.toInt()}%)");
+
+               PodLogger.info('sync', 'Filter complete', detail: 'logs=${result.logs.length}, health=${result.healthScore.toInt()}%');
                
                state = state.copyWith(statusMessage: "Data Verified (Health: ${result.healthScore.toInt()}%)");
                
@@ -143,7 +156,7 @@ class PodNotifier extends Notifier<PodState> {
                }
 
              } catch (e) {
-               debugPrint("❌ Filter Error: $e");
+               PodLogger.error('sync', 'Filter error', detail: '$e');
                // Fallback: If filter crashes, return raw logs so user doesn't lose data
                if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
                  _syncCompleter!.complete(rawLogs); 
@@ -266,11 +279,22 @@ class PodNotifier extends Notifier<PodState> {
 
       if (name.startsWith("POD")) {
         final currentList = List<Map<String, dynamic>>.from(state.scannedDevices);
-        
-        if (!currentList.any((d) => d['id'] == id)) {
+
+        final existingIdx = currentList.indexWhere((d) => d['id'] == id);
+        if (existingIdx == -1) {
           currentList.add(deviceMap);
-          state = state.copyWith(scannedDevices: currentList);
+        } else {
+          // Update RSSI for existing device
+          currentList[existingIdx] = deviceMap;
         }
+
+        // G2: Track RSSI for connected device
+        final rssi = deviceMap['rssi'] as int?;
+        final isConnectedDevice = id == state.connectedDeviceId;
+        state = state.copyWith(
+          scannedDevices: currentList,
+          lastRssi: isConnectedDevice && rssi != null ? rssi : state.lastRssi,
+        );
 
         // Auto-Connect Logic
         if (lastId != null && id == lastId && !_hasAutoConnected && state.connectedDeviceId == null) {
@@ -303,7 +327,7 @@ class PodNotifier extends Notifier<PodState> {
         await _native.requestBatteryExemption();
       }
     } catch (e) {
-      debugPrint("Battery exemption request skipped or failed: $e");
+      PodLogger.debug('ble', 'Battery exemption skipped', detail: '$e');
     }
   }
 
@@ -403,7 +427,7 @@ class PodNotifier extends Notifier<PodState> {
     _isCancellingDownload = false;
     List<SensorLog> masterSessionLogs = [];
 
-    debugPrint("🚀 Starting Batch Sync (${filesToSync.length} files)...");
+    PodLogger.info('sync', 'Starting batch sync', detail: '${filesToSync.length} files');
 
     // Download loop
     for (int i = 0; i < filesToSync.length; i++) {
@@ -413,7 +437,7 @@ class PodNotifier extends Notifier<PodState> {
       // --- HANDOVER GAP FIX ---
       // Give the Pod firmware 500ms to finish closing the previous file pointer
       if (i > 0) {
-        debugPrint("⏳ Handover Cooldown (500ms)...");
+        PodLogger.debug('sync', 'Handover cooldown (500ms)');
         await Future.delayed(const Duration(milliseconds: 500));
       }
 
@@ -435,7 +459,7 @@ class PodNotifier extends Notifier<PodState> {
         }
       } catch (e) {
         // Log error but continue to next file (Best Effort Strategy)
-        debugPrint("   ⚠️ Failed to download $fileName: $e");
+        PodLogger.error('sync', 'Failed to download file', detail: '$fileName: $e');
       }
     }
 
@@ -447,9 +471,24 @@ class PodNotifier extends Notifier<PodState> {
 
     state = state.copyWith(statusMessage: "Finalizing Session...");
 
-    // --- 3. SORTING & NAMING ---
+    // --- 3. DEDUPLICATION & SORTING ---
     // Sort by time just in case files were downloaded in random order
     masterSessionLogs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    // G4: Deduplicate logs by packetId+timestamp to prevent duplicate sessions
+    // from re-downloaded files
+    final seen = <String>{};
+    final deduped = <SensorLog>[];
+    for (final log in masterSessionLogs) {
+      final key = '${log.packetId}_${log.timestamp.millisecondsSinceEpoch}';
+      if (seen.add(key)) {
+        deduped.add(log);
+      }
+    }
+    if (deduped.length < masterSessionLogs.length) {
+      PodLogger.info('sync', 'Deduplicated logs', detail: 'removed ${masterSessionLogs.length - deduped.length} duplicates');
+    }
+    masterSessionLogs = deduped;
 
     final startTime = masterSessionLogs.first.timestamp;
     // Format: YYYYMMDD_HHMM
@@ -516,20 +555,46 @@ class PodNotifier extends Notifier<PodState> {
   // ===========================================================================
   
   /// Helper function that wraps the native file download stream in a [Future].
-  Future<List<SensorLog>> downloadLogFile(String fileInfo, { 
+  /// Retries up to [maxRetries] times with exponential backoff on failure.
+  Future<List<SensorLog>> downloadLogFile(String fileInfo, {
     DateTime? start,
     DateTime? end,
     int totalFiles = 1,
-    int currentIndex = 1
+    int currentIndex = 1,
+    int maxRetries = 2,
   }) async {
-    _syncCompleter = Completer<List<SensorLog>>(); 
-    state = state.copyWith(downloadedFileBytes: null, statusMessage: "Requesting Data...");
-    
     int startMillis = start?.millisecondsSinceEpoch ?? 0;
     int endMillis = end?.millisecondsSinceEpoch ?? 0;
 
-    await _native.downloadFile(fileInfo, startMillis, endMillis, totalFiles, currentIndex);
-    return _syncCompleter!.future.timeout(const Duration(minutes: 15));
+    for (int attempt = 0; attempt <= maxRetries; attempt++) {
+      // Cancel any in-flight native download before retrying
+      if (attempt > 0) {
+        await _native.cancelDownload();
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+
+      _syncCompleter = Completer<List<SensorLog>>();
+      state = state.copyWith(downloadedFileBytes: null, statusMessage: attempt > 0
+          ? "Retrying ($attempt/$maxRetries)..."
+          : "Requesting Data...");
+
+      try {
+        await _native.downloadFile(fileInfo, startMillis, endMillis, totalFiles, currentIndex);
+        final result = await _syncCompleter!.future.timeout(const Duration(minutes: 15));
+        return result;
+      } catch (e) {
+        PodLogger.warn('sync', 'Download attempt failed', detail: 'attempt=${attempt + 1}: $e');
+        if (attempt < maxRetries) {
+          // Exponential backoff: 2s, 4s
+          final delay = Duration(seconds: 2 * (attempt + 1));
+          await Future.delayed(delay);
+        } else {
+          rethrow;
+        }
+      }
+    }
+    // Unreachable, but satisfies the compiler
+    return [];
   }
 
   // ===========================================================================

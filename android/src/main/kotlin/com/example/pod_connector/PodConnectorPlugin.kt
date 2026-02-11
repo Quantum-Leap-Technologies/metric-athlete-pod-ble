@@ -77,6 +77,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     // --- BLUETOOTH OBJECTS ---
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothGatt: BluetoothGatt? = null
+    private val gattLock = Object()
     
     // --- UUID CONSTANTS ---
     // The specific UUIDs defined in the STM32 Firmware
@@ -128,24 +129,26 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         override fun run() {
             val now = System.currentTimeMillis()
             val timeSinceLastPacket = now - lastPacketTime
-            
+
             // Case 1: Hard Timeout (No data for 60s)
             if (totalExpectedPackets > 0 && timeSinceLastPacket > WATCHDOG_TIMEOUT_MS) {
                 Log.w(TAG, "Watchdog: Timeout. Force closing download.")
                 finishMessage()
                 return
             }
-            
+
             // Case 2: The "99% Stuck" Bug
-            // Sometimes the last packet drops. If we are >98% done but waiting >2.5s, just finish.
-            if (totalExpectedPackets > 0 && timeSinceLastPacket > 2500) {
+            // Only check after receiving at least 1 packet to avoid false positives.
+            // Increased threshold to 5s for slow BLE connections near completion.
+            if (receivedPacketCount > 0 && totalExpectedPackets > 0 && timeSinceLastPacket > 5000) {
                 val progress = (receivedPacketCount.toDouble() / totalExpectedPackets.toDouble())
                 if (progress > 0.98) {
+                    Log.w(TAG, "Watchdog: Stuck at ${(progress * 100).toInt()}%. Finishing.")
                     finishMessage()
                     return
                 }
             }
-            watchdogHandler.postDelayed(this, 1000) 
+            watchdogHandler.postDelayed(this, 1000)
         }
     }
 
@@ -287,10 +290,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             
             val type = packet[0].toInt() and 0xFF
             currentMessageType = type
-            
+
             // Read Total Packets
             totalExpectedPackets = ByteBuffer.wrap(packet, 5, 4).order(ByteOrder.LITTLE_ENDIAN).int
-            
+
+            // Guard against corrupted headers: cap at 500,000 packets (~32MB at 64B/packet)
+            val MAX_EXPECTED_PACKETS = 500_000
+            if (totalExpectedPackets <= 0 || totalExpectedPackets > MAX_EXPECTED_PACKETS) {
+                Log.e(TAG, "Invalid totalExpectedPackets: $totalExpectedPackets — aborting download")
+                totalExpectedPackets = 0
+                return
+            }
+
             // --- OPTIMIZATION: DYNAMIC MEMORY ALLOCATION ---
             // Use the 'actualPacketSize' variable (already captured in the thread loop).
             // This ensures we respect the dynamic MTU (e.g. 64 vs 247).
@@ -337,6 +348,8 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private fun performSmartPeek() {
         try {
             val allData = payloadBuffer.toByteArray()
+            // Guard: need at least 129 bytes (1 type byte + 128 data bytes)
+            if (allData.size < 129) return
             val peekData = ByteArray(128)
             System.arraycopy(allData, 1, peekData, 0, 128)
 
@@ -378,16 +391,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         
         startProcessingThread()
         val device = bluetoothAdapter?.getRemoteDevice(address)
-        
+
         // Auto-connect set to 'false' for faster initial connection
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            bluetoothGatt = device?.connectGatt(
-                context, false, gattCallback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, bluetoothHandler
-            )
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            bluetoothGatt = device?.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            bluetoothGatt = device?.connectGatt(context, false, gattCallback)
+        synchronized(gattLock) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                bluetoothGatt = device?.connectGatt(
+                    context, false, gattCallback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, bluetoothHandler
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                bluetoothGatt = device?.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                bluetoothGatt = device?.connectGatt(context, false, gattCallback)
+            }
         }
     }
 
@@ -396,11 +411,13 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         val serviceIntent = Intent(context, PodForegroundService::class.java)
         serviceIntent.action = "STOP"
         context.startService(serviceIntent)
-        
+
         stopProcessingThread()
-        bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
-        bluetoothGatt = null
+        synchronized(gattLock) {
+            bluetoothGatt?.disconnect()
+            bluetoothGatt?.close()
+            bluetoothGatt = null
+        }
         notificationManager.cancel(NOTIF_ID)
         sendStatus("Disconnected")
     }
@@ -602,11 +619,13 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         }
     }
 
-    private fun writeData(d: ByteArray) { 
-        val c = bluetoothGatt?.getService(SERVICE_UUID)?.getCharacteristic(WRITE_CHAR_UUID)
-        if (c != null) { 
-            c.value = d
-            bluetoothGatt?.writeCharacteristic(c) 
+    private fun writeData(d: ByteArray) {
+        synchronized(gattLock) {
+            val c = bluetoothGatt?.getService(SERVICE_UUID)?.getCharacteristic(WRITE_CHAR_UUID)
+            if (c != null) {
+                c.value = d
+                bluetoothGatt?.writeCharacteristic(c)
+            }
         }
     }
 

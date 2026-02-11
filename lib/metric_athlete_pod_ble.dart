@@ -17,10 +17,10 @@ export 'utils/logs_binary_parser.dart';
 export 'utils/usb_file_predictor.dart';
 export 'utils/trajectory_filter.dart';
 export 'utils/butterworth_filter.dart';
-export 'utils/kalman_gps_filter.dart';
 export 'utils/filter_pipeline.dart';
 export 'utils/stats_calculator.dart';
 export 'utils/session_cluster.dart';
+export 'utils/pod_logger.dart';
 
 // Services
 export 'services/usb_file_processor.dart';

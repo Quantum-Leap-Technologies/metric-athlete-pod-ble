@@ -46,21 +46,34 @@ class ButterworthFilter {
   ///
   /// Returns a new list with the filtered values. The input is not modified.
   /// For signals shorter than 6 samples, returns the input unchanged.
+  /// NaN and Infinity values are replaced with the previous valid value
+  /// (or zero) before filtering to prevent propagation through the IIR.
   List<double> filtfilt(List<double> signal) {
     if (signal.length < 6) return List.from(signal);
 
+    // Sanitize NaN/Infinity values before filtering
+    final List<double> clean = List.from(signal);
+    double lastValid = 0.0;
+    for (int i = 0; i < clean.length; i++) {
+      if (clean[i].isNaN || clean[i].isInfinite) {
+        clean[i] = lastValid;
+      } else {
+        lastValid = clean[i];
+      }
+    }
+
     // Pad signal to reduce edge effects (reflect 3 samples at each end)
-    final int padLen = min(3, signal.length - 1);
+    final int padLen = min(3, clean.length - 1);
     final List<double> padded = [];
 
     // Reflect start
     for (int i = padLen; i > 0; i--) {
-      padded.add(2.0 * signal[0] - signal[i]);
+      padded.add(2.0 * clean[0] - clean[i]);
     }
-    padded.addAll(signal);
+    padded.addAll(clean);
     // Reflect end
-    for (int i = signal.length - 2; i >= signal.length - 1 - padLen; i--) {
-      padded.add(2.0 * signal.last - signal[i]);
+    for (int i = clean.length - 2; i >= clean.length - 1 - padLen; i--) {
+      padded.add(2.0 * clean.last - clean[i]);
     }
 
     // Forward pass
@@ -74,7 +87,7 @@ class ButterworthFilter {
 
     // Reverse again and strip padding
     final List<double> result = backward.reversed.toList();
-    return result.sublist(padLen, padLen + signal.length);
+    return result.sublist(padLen, padLen + clean.length);
   }
 
   /// Single-pass IIR filter (Direct Form I).

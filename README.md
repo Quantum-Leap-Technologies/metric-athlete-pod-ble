@@ -13,6 +13,11 @@
 * **Advanced Data Cleaning:** Implements a 5-Stage Pipeline (Sanity Check -> Linear Interpolation -> Kalman+RTS -> Butterworth Low-Pass -> Outlier Rejection) to reconstruct timelines from lossy BLE data.
 * **Session Management:** Auto-clusters raw data into logical "Sessions" based on time gaps.
 * **Session Analytics:** Computes 30+ performance metrics including speed zones, player load, impacts, HMLD, fatigue index, and metabolic power estimates.
+* **Structured Diagnostic Logging:** PodLogger with ring buffer (500 entries), severity levels, category filtering, and external listener hook.
+* **RSSI Signal Strength Tracking:** Real-time BLE signal quality monitoring in PodState.
+* **Clock Drift Detection:** Detects drift between pod RTC and device clock during sync.
+* **Data Deduplication:** Filters duplicate records by packetId+timestamp during sync.
+* **Download Retry:** Cancel-before-retry pattern for reliable file downloads.
 
 ---
 
@@ -53,6 +58,7 @@ Handles the "heavy lifting" of Bluetooth communication on each platform.
 * **`TrajectoryFilter`:** Multi-stage post-processing engine that repairs and smooths sensor data (Sanity Check, Gap Repair, Kalman+RTS).
 * **`ButterworthFilter`:** 2nd-order zero-phase low-pass filter for IMU noise reduction.
 * **`StatsCalculator`:** Computes 30+ session metrics (distances, speed zones, impacts, player load, metabolic power).
+* **`PodLogger`:** Structured diagnostic logging with ring buffer, severity levels (debug/info/warn/error), and category filtering.
 
 ---
 
@@ -130,6 +136,14 @@ After filtering, the `StatsCalculator` computes 30+ metrics from the clean data:
 * **Metabolic Metrics** (weight-dependent): HMLD (High Metabolic Load Distance), energy expenditure, momentum peak, power play count.
 * **Data Quality:** GPS quality percentage, data gap count, health score.
 
+### Diagnostic Logging (`PodLogger`)
+The plugin includes a structured logging system for BLE and sync diagnostics:
+* **Severity levels:** `debug`, `info`, `warn`, `error` via `PodLogger.debug(category, message)`, `.info(...)`, `.warn(...)`, `.error(...)`.
+* **Ring buffer:** Retains the last 500 entries, accessible via `PodLogger.entries`.
+* **Filtering:** `PodLogger.entriesForCategory('ble')` or `PodLogger.entriesAtLevel(LogLevel.warn)`.
+* **External listener:** Set `PodLogger.onLog = (entry) { ... }` to forward logs to your own analytics or crash reporting.
+* **Categories used:** `ble` (connections/scanning), `sync` (file downloads/processing), `protocol` (binary decoding), `clock` (drift detection).
+
 ## Setup & Installation
 
 ### Android Permissions
@@ -184,7 +198,7 @@ lib/
 ├── utils/
 │   ├── butterworth_filter.dart    # 2nd-order zero-phase low-pass filter
 │   ├── filter_pipeline.dart       # Unified pipeline orchestrator (all 5 stages)
-│   ├── kalman_gps_filter.dart     # Simple 2D Kalman for quick GPS smoothing
+│   ├── pod_logger.dart            # Structured diagnostic logging (ring buffer, severity, categories)
 │   ├── logs_binary_parser.dart    # Byte-level extraction logic
 │   ├── pod_protocol_decoder.dart  # Binary Packet Router
 │   ├── session_cluster.dart       # Logic to split runs by time gaps
@@ -213,7 +227,7 @@ windows/
 
 1.  **Download Hangs:**
     * *Issue:* Packet loss can cause the download loop to wait forever if the Pod stops transmitting.
-    * *Fix:* A Watchdog timer on each native platform forces the stream to close if no bytes are received for 60s, or if progress exceeds 98% but stalls for >2.5s.
+    * *Fix:* A Watchdog timer on each native platform forces the stream to close if no bytes are received for 60s, or if progress exceeds 98% but stalls for >5s.
 2.  **Filter Output Shifts:**
     * *Observation:* Filtered data graphs may appear shifted to the left compared to Raw data.
     * *Cause:* The filter drops stationary data at the start of a session.

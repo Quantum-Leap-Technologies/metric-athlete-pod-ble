@@ -69,6 +69,63 @@ class HomePage extends ConsumerWidget {
           ),
           const SizedBox(height: 16),
 
+          // --- Connection Diagnostics ---
+          if (isConnected)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    // RSSI
+                    Expanded(
+                      child: Row(
+                        children: [
+                          Icon(
+                            _rssiIcon(podState.lastRssi),
+                            color: _rssiColor(podState.lastRssi),
+                            size: 20,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            podState.lastRssi != null
+                                ? '${podState.lastRssi} dBm'
+                                : 'RSSI: --',
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // Clock Drift
+                    Expanded(
+                      child: Row(
+                        children: [
+                          Icon(
+                            podState.clockDriftMs != null &&
+                                    podState.clockDriftMs!.abs() > 5000
+                                ? Icons.warning_amber
+                                : Icons.access_time,
+                            color: podState.clockDriftMs != null &&
+                                    podState.clockDriftMs!.abs() > 5000
+                                ? Colors.orange
+                                : Colors.grey,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            podState.clockDriftMs != null
+                                ? 'Drift: ${podState.clockDriftMs}ms'
+                                : 'Drift: --',
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (isConnected) const SizedBox(height: 16),
+
           // --- Scan ---
           const _SectionHeader('BLE Scanning'),
           SizedBox(
@@ -294,10 +351,120 @@ class HomePage extends ConsumerWidget {
               const SizedBox(height: 8),
               _TelemetryCard(podState.latestTelemetry!),
             ],
+            const Divider(height: 32),
+
+            // --- Diagnostic Logs ---
+            const _SectionHeader('Diagnostic Logs'),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  '${PodLogger.entries.length} entries',
+                  style: const TextStyle(fontSize: 13, color: Colors.grey),
+                ),
+                TextButton(
+                  onPressed: () {
+                    PodLogger.clear();
+                    // Trigger rebuild via a no-op state read
+                    ref.read(podNotifierProvider);
+                  },
+                  child: const Text('Clear Logs'),
+                ),
+              ],
+            ),
+            if (PodLogger.entries.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(12),
+                child: Text(
+                  'No log entries yet.',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              )
+            else
+              ...PodLogger.entries
+                  .reversed
+                  .take(10)
+                  .map((entry) => Card(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 8),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(
+                                _logLevelIcon(entry.level),
+                                color: _logLevelColor(entry.level),
+                                size: 16,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      '[${entry.category}] ${entry.message}',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: _logLevelColor(entry.level),
+                                      ),
+                                    ),
+                                    if (entry.detail != null)
+                                      Text(
+                                        entry.detail!,
+                                        style: const TextStyle(
+                                            fontSize: 11, color: Colors.grey),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      )),
           ],
         ],
       ),
     );
+  }
+}
+
+IconData _rssiIcon(int? rssi) {
+  if (rssi == null) return Icons.signal_wifi_off;
+  if (rssi >= -60) return Icons.signal_cellular_alt;
+  if (rssi >= -80) return Icons.signal_cellular_alt_2_bar;
+  return Icons.signal_cellular_alt_1_bar;
+}
+
+Color _rssiColor(int? rssi) {
+  if (rssi == null) return Colors.grey;
+  if (rssi >= -60) return Colors.green;
+  if (rssi >= -80) return Colors.orange;
+  return Colors.red;
+}
+
+IconData _logLevelIcon(LogLevel level) {
+  switch (level) {
+    case LogLevel.debug:
+      return Icons.bug_report;
+    case LogLevel.info:
+      return Icons.info_outline;
+    case LogLevel.warn:
+      return Icons.warning_amber;
+    case LogLevel.error:
+      return Icons.error_outline;
+  }
+}
+
+Color _logLevelColor(LogLevel level) {
+  switch (level) {
+    case LogLevel.debug:
+      return Colors.grey;
+    case LogLevel.info:
+      return Colors.green;
+    case LogLevel.warn:
+      return Colors.orange;
+    case LogLevel.error:
+      return Colors.red;
   }
 }
 

@@ -36,6 +36,7 @@ cd example && flutter run                # Run example/test harness app
 - `utils/pod_protocol_decoder.dart` - Decodes raw binary payloads by message type (0x01=live telemetry, 0x02=file list, 0x03=file data, 0x05=settings, 0xDA=file skipped)
 - `utils/logs_binary_parser.dart` - Parses 64-byte binary records from `.bin` files into `SensorLog` objects with byte-level sync recovery
 - `services/storage_service.dart` - CSV read/write for session data persistence
+- `utils/pod_logger.dart` - Structured diagnostic logging with ring buffer (500 entries), severity levels (debug/info/warn/error), category filtering, and optional external listener hook
 
 ### Binary Protocol
 
@@ -58,7 +59,6 @@ The `FilterPipeline` (`lib/utils/filter_pipeline.dart`) orchestrates all stages 
 5. **Stage 4 (Outlier Rejection)** in `FilterPipeline` - Speed-based GPS outlier rejection using Haversine distance checks per 100ms interval
 
 Additional processing:
-- `KalmanGpsFilter` - Simpler 2D Kalman (constant-position model) for quick filtering without full RTS
 - `SessionClusterer` - Splits logs into sessions using 10-minute gap threshold, filters sessions < 5 minutes
 - `StatsCalculator` - Computes `SessionStats` with speed zones (Resting/Walking/Jogging/Running/Sprinting), player load, impacts, HMLD, fatigue index, and 30+ metrics. Resamples to 1Hz for GPS calculations
 
@@ -66,13 +66,13 @@ Additional processing:
 
 - `SensorLog` - 64-byte binary record: packetId, timestamp, lat/lon/speed, accelXYZ, gyroXYZ, filteredAccelXYZ
 - `LiveTelemetry` - 72-byte live stream: kernelTick, battery, accelerometer/gyroscope/filteredGravity (Vector3), GPS data, fix quality
-- `PodState` - Immutable state for UI: scanning, connection, files, telemetry history, recording, settings, raw clusters
+- `PodState` - Immutable state for UI: scanning, connection, files, telemetry history, recording, settings, raw clusters, lastRssi (BLE signal strength), clockDriftMs (pod vs device clock)
 - `SessionStats` - 30+ computed metrics matching the `session_data` database table, with `toMap()`/`fromMap()` for GraphQL
 - `SessionBlock` - Clustered session with start/end times, logs, and estimated stats
 
 ### Native-Specific Behavior
 
-**Android**: Uses Foreground Service + WakeLock to prevent OS from killing BLE during downloads. Dedicated processing thread (THREAD_PRIORITY_URGENT_AUDIO) drains packet queue separately from GATT callback thread. Watchdog kills connections after 60s inactivity or 2.5s stall above 98% progress.
+**Android**: Uses Foreground Service + WakeLock to prevent OS from killing BLE during downloads. Dedicated processing thread (THREAD_PRIORITY_URGENT_AUDIO) drains packet queue separately from GATT callback thread. Watchdog kills connections after 60s inactivity or 5s stall above 98% progress.
 
 **iOS/macOS**: `PodBLECore` is a shared Swift class used by both platforms. Packet reassembly and Smart Peek run on a dedicated `bleQueue` (DispatchQueue). No foreground service equivalent; relies on `Info.plist` background BLE mode.
 
@@ -88,3 +88,4 @@ Additional processing:
 - The barrel file `lib/metric_athlete_pod_ble.dart` exports all public APIs - import via `package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart`
 - CSV format: `Timestamp,KernelCount,Lat,Lon,Speed_Kph,AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ,FiltAccelX,FiltAccelY,FiltAccelZ`
 - Filter thresholds are tuned for rugby athletics (max 45 km/h sprint, 16G accelerometer, 5G impact threshold)
+- PodLogger categories: `ble` (connections/scanning), `sync` (file downloads/processing), `protocol` (binary decoding), `clock` (drift detection)

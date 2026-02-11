@@ -11,7 +11,7 @@ dependencies:
     sdk: flutter
   metric_athlete_pod_ble:
     path: ../
-  flutter_riverpod: ^2.5.1
+  flutter_riverpod: ^3.0.3
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

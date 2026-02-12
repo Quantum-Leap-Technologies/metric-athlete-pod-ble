@@ -27,19 +27,19 @@ public class PodConnectorPlugin: NSObject, FlutterPlugin {
             name: "com.example.pod_connector/status",
             binaryMessenger: registrar.messenger()
         )
-        statusChannel.setStreamHandler(instance.StatusStreamHandler(plugin: instance))
+        statusChannel.setStreamHandler(StatusStreamHandler(plugin: instance))
 
         let scanChannel = FlutterEventChannel(
             name: "com.example.pod_connector/scan",
             binaryMessenger: registrar.messenger()
         )
-        scanChannel.setStreamHandler(instance.ScanStreamHandler(plugin: instance))
+        scanChannel.setStreamHandler(ScanStreamHandler(plugin: instance))
 
         let payloadChannel = FlutterEventChannel(
             name: "com.example.pod_connector/payload",
             binaryMessenger: registrar.messenger()
         )
-        payloadChannel.setStreamHandler(instance.PayloadStreamHandler(plugin: instance))
+        payloadChannel.setStreamHandler(PayloadStreamHandler(plugin: instance))
 
         // Initialize BLE Core
         instance.bleCore = PodBLECore()

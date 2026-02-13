@@ -152,7 +152,14 @@ class PodBLECore: NSObject {
 
     func downloadFile(filename: String, start: Int64, end: Int64, totalFiles: Int, currentIndex: Int) {
         stopWatchdog()
+        
+        // CRITICAL: Reset ALL download state before starting new download
+        // This ensures we're ready to receive a fresh header packet
+        print("PodBLECore: Starting download: filename=\(filename), currentState: receivedPacketCount=\(receivedPacketCount), totalExpectedPackets=\(totalExpectedPackets), currentMessageType=\(currentMessageType)")
+        
         resetDownloadState()
+        
+        print("PodBLECore: State reset complete: receivedPacketCount=\(receivedPacketCount), totalExpectedPackets=\(totalExpectedPackets), currentMessageType=\(currentMessageType)")
 
         totalFilesInPack = totalFiles
         currentFileIndex = currentIndex
@@ -213,6 +220,8 @@ class PodBLECore: NSObject {
         if receivedPacketCount == 0 {
             // First packet (header)
             guard packet.count >= 9 else { return }
+
+            print("PodBLECore: Header packet received: type=0x\(String(type, radix: 16)), size=\(packet.count)")
 
             currentMessageType = type
 
@@ -340,16 +349,26 @@ class PodBLECore: NSObject {
     private func watchdogTick() {
         let elapsed = Date().timeIntervalSince(lastPacketTime)
 
-        // Hard timeout
+        // Case 1: Waiting for header packet timeout (no packets received yet)
+        // If we've been waiting for a header for more than 10 seconds, abort
+        if receivedPacketCount == 0 && totalExpectedPackets == 0 && elapsed > 10.0 {
+            print("PodBLECore: Watchdog: No valid header received after \(elapsed)s. Aborting download.")
+            cancelDownload()
+            return
+        }
+
+        // Case 2: Hard timeout (no data for 60s during active download)
         if totalExpectedPackets > 0 && elapsed > watchdogTimeoutSeconds {
+            print("PodBLECore: Watchdog: Timeout. Force closing download.")
             finishMessage()
             return
         }
 
-        // Stuck at 99% check
+        // Case 3: Stuck at 99% check
         if totalExpectedPackets > 0 && elapsed > stuckThresholdSeconds {
             let progress = Double(receivedPacketCount) / Double(totalExpectedPackets)
             if progress > stuckProgressThreshold {
+                print("PodBLECore: Watchdog: Stuck at \(Int(progress * 100))%. Finishing.")
                 finishMessage()
                 return
             }

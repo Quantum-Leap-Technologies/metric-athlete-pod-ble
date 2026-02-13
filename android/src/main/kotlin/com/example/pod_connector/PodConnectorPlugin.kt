@@ -145,14 +145,22 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val now = System.currentTimeMillis()
             val timeSinceLastPacket = now - lastPacketTime
 
-            // Case 1: Hard Timeout (No data for 60s)
+            // Case 1: Waiting for header packet timeout (no packets received yet)
+            // If we've been waiting for a header for more than 10 seconds, abort
+            if (receivedPacketCount == 0 && totalExpectedPackets == 0 && timeSinceLastPacket > 10000) {
+                Log.w(TAG, "Watchdog: No valid header received after ${timeSinceLastPacket}ms. Aborting download.")
+                abortDownload("No valid header received. Aborting download.")
+                return
+            }
+
+            // Case 2: Hard Timeout (No data for 60s during active download)
             if (totalExpectedPackets > 0 && timeSinceLastPacket > WATCHDOG_TIMEOUT_MS) {
                 Log.w(TAG, "Watchdog: Timeout. Force closing download.")
                 finishMessage()
                 return
             }
 
-            // Case 2: The "99% Stuck" Bug
+            // Case 3: The "99% Stuck" Bug
             // Only check after receiving at least 1 packet to avoid false positives.
             // Increased threshold to 5s for slow BLE connections near completion.
             if (receivedPacketCount > 0 && totalExpectedPackets > 0 && timeSinceLastPacket > 5000) {
@@ -351,20 +359,23 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         }
 
         if (receivedPacketCount == 0) {
-            // --- HEADER PACKET (seq=1) ---
+            // --- HEADER PACKET (seq=0 or seq=1) ---
             if (packet.size < 9) {
                 Log.w(TAG, "Packet too small for header (seq=$seq, size=${packet.size})")
                 return
             }
             
-            // Validate that this is actually the header packet (seq=1)
-            if (seq != 1) {
-                Log.w(TAG, "Expected header packet (seq=1), got seq=$seq. Buffering...")
+            // Validate that this is actually the header packet (seq=0 or seq=1)
+            // Some pods may send seq=0 as the header, others send seq=1
+            if (seq != 0 && seq != 1) {
+                Log.w(TAG, "Expected header packet (seq=0 or seq=1), got seq=$seq. Buffering...")
                 // Buffer it and wait for the real header
                 outOfOrderBuffer[seq] = packet.copyOf()
                 receivedSequences.add(seq)
                 return
             }
+            
+            Log.d(TAG, "Header packet received: type=0x${type.toString(16)}, seq=$seq, size=${packet.size}")
             
             currentMessageType = type
 
@@ -402,13 +413,16 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
             payloadBuffer.write(currentMessageType) 
             
+            // For seq=0 header, payload starts at byte 9
+            // For seq=1 header, payload starts at byte 9 (same offset)
             if (packet.size > 9) {
                 payloadBuffer.write(packet, 9, packet.size - 9)
             }
             
             receivedSequences.add(seq)
             receivedPacketCount = 1
-            nextExpectedSeq = 2 // Next packet should be seq=2
+            // If header was seq=0, next packet should be seq=1; if header was seq=1, next should be seq=2
+            nextExpectedSeq = if (seq == 0) 1 else 2
             
             Log.d(TAG, "Header processed: type=0x${type.toString(16)}, seq=$seq, totalPackets=$totalExpectedPackets, payloadSize=${payloadBuffer.size()}")
             
@@ -611,12 +625,22 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     // --- DOWNLOAD FLOW ---
     private fun startDownloadWithGatekeeper(filename: String, start: Long, end: Long) {
         stopWatchdog()
-        // Reset State
+        
+        // CRITICAL: Reset ALL download state before starting new download
+        // This ensures we're ready to receive a fresh header packet
+        Log.d(TAG, "Starting download: filename=$filename, currentState: receivedPacketCount=$receivedPacketCount, totalExpectedPackets=$totalExpectedPackets, currentMessageType=$currentMessageType")
+        
         packetQueue.clear()
         resetDownloadState()
         actualPacketSize = 0 
         lastPercent = -1
         lastUiUpdateTime = 0
+        isSmartPeekDone = false
+        
+        Log.d(TAG, "State reset complete: receivedPacketCount=$receivedPacketCount, totalExpectedPackets=$totalExpectedPackets, currentMessageType=$currentMessageType")
+        
+        // Small delay to ensure any previous message processing completes
+        Thread.sleep(100)
         
         updateNotification("Syncing Data", "File $currentFileIndex of $totalFilesInPack", true, calculateOverallPercent(0))
         

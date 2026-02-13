@@ -196,11 +196,24 @@ class PodBLECore: NSObject {
     private func processPacket(_ packet: Data) {
         guard packet.count >= 5 else { return }
 
+        // Extract message type first (byte 0)
+        let type = packet[0]
+        
+        // **STATE RESET FOR NON-DOWNLOAD MESSAGES**
+        // File list (0x02), live telemetry (0x01), and settings (0x05) are single-message responses.
+        // If we receive one of these while in the middle of a download (receivedPacketCount > 0),
+        // we must reset state to process it as a new message.
+        // Only file downloads (0x03) are multi-packet and should continue from previous state.
+        let isNonDownloadMessage = (type == 0x01 || type == 0x02 || type == 0x05)
+        if isNonDownloadMessage && receivedPacketCount > 0 {
+            print("PodBLECore: Non-download message (type=0x\(String(type, radix: 16))) received - resetting download state")
+            resetDownloadState()
+        }
+
         if receivedPacketCount == 0 {
             // First packet (header)
             guard packet.count >= 9 else { return }
 
-            let type = packet[0]
             currentMessageType = type
 
             // Read total expected packets (bytes 5-8, little endian)
@@ -349,6 +362,7 @@ class PodBLECore: NSObject {
         receivedPacketCount = 0
         totalExpectedPackets = 0
         actualPacketSize = 0
+        currentMessageType = 0
         isSmartPeekDone = false
         payloadBuffer = Data()
     }

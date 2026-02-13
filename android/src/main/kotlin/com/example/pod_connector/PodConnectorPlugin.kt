@@ -308,10 +308,24 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private fun processPacket(packet: ByteArray) {
         if (packet.size < 5) return 
 
+        // Extract message type first (byte 0)
+        val type = packet[0].toInt() and 0xFF
+        
         // Extract sequence number (bytes 1-4, little endian)
         val seq = ByteBuffer.wrap(packet, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int
         
-        // Check for duplicate packets
+        // **STATE RESET FOR NON-DOWNLOAD MESSAGES**
+        // File list (0x02), live telemetry (0x01), and settings (0x05) are single-message responses.
+        // If we receive one of these while in the middle of a download (receivedPacketCount > 0),
+        // we must reset state to process it as a new message.
+        // Only file downloads (0x03) are multi-packet and should continue from previous state.
+        val isNonDownloadMessage = (type == 0x01 || type == 0x02 || type == 0x05)
+        if (isNonDownloadMessage && receivedPacketCount > 0) {
+            Log.d(TAG, "Non-download message (type=0x${type.toString(16)}) received - resetting download state")
+            resetDownloadState()
+        }
+        
+        // Check for duplicate packets (after potential state reset)
         if (receivedSequences.contains(seq)) {
             Log.d(TAG, "Duplicate packet detected (seq=$seq), ignoring")
             return
@@ -333,7 +347,6 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                 return
             }
             
-            val type = packet[0].toInt() and 0xFF
             currentMessageType = type
 
             // Read Total Packets
@@ -471,6 +484,22 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     /**
+     * Reset download state to handle a new message.
+     * Called when non-download messages arrive or when explicitly resetting state.
+     */
+    private fun resetDownloadState() {
+        receivedPacketCount = 0
+        totalExpectedPackets = 0
+        nextExpectedSeq = 1
+        payloadBuffer.reset()
+        outOfOrderBuffer.clear()
+        receivedSequences.clear()
+        isSmartPeekDone = false
+        lastFlushTime = 0
+        currentMessageType = 0
+    }
+
+    /**
      * **Smart Peek Algorithm**
      * Instead of downloading the whole file to check the date, we check the first 128 bytes.
      * The first 64 bytes contain the File Header (Time, Size, etc.).
@@ -558,17 +587,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         stopWatchdog()
         // Reset State
         packetQueue.clear()
-        receivedPacketCount = 0
-        totalExpectedPackets = 0
+        resetDownloadState()
         actualPacketSize = 0 
         lastPercent = -1
-        isSmartPeekDone = false 
         lastUiUpdateTime = 0
-        payloadBuffer.reset()
-        nextExpectedSeq = 1
-        outOfOrderBuffer.clear()
-        receivedSequences.clear()
-        lastFlushTime = 0
         
         updateNotification("Syncing Data", "File $currentFileIndex of $totalFilesInPack", true, calculateOverallPercent(0))
         
@@ -614,14 +636,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         writeData(byteArrayOf(0x08)) // Send Cancel Command (0x08)
         
         packetQueue.clear()
-        receivedPacketCount = 0
-        totalExpectedPackets = 0
-        payloadBuffer.reset()
-        isSmartPeekDone = false
-        nextExpectedSeq = 1
-        outOfOrderBuffer.clear()
-        receivedSequences.clear()
-        lastFlushTime = 0
+        resetDownloadState()
         
         // Send "Skipped" signal (0xDA) to Flutter so it moves to next file
         mainHandler.postDelayed({ payloadSink?.success(byteArrayOf(0xDA.toByte())) }, 600)

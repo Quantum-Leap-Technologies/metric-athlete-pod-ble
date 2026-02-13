@@ -146,9 +146,12 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val timeSinceLastPacket = now - lastPacketTime
 
             // Case 1: Waiting for header packet timeout (no packets received yet)
+            // Only check this if we're actually expecting a download (currentMessageType == 0x03 or we just sent a download command)
             // If we've been waiting for a header for more than 10 seconds, abort
             if (receivedPacketCount == 0 && totalExpectedPackets == 0 && timeSinceLastPacket > 10000) {
-                Log.w(TAG, "Watchdog: No valid header received after ${timeSinceLastPacket}ms. Aborting download.")
+                // Check if we're actually in a download state (currentMessageType == 0x03 means we're expecting file data)
+                // OR if we just sent a download command (we can infer this from the watchdog being active)
+                Log.w(TAG, "Watchdog: No valid header received after ${timeSinceLastPacket}ms. State: receivedPacketCount=$receivedPacketCount, totalExpectedPackets=$totalExpectedPackets, currentMessageType=0x${currentMessageType.toString(16)}. Aborting download.")
                 abortDownload("No valid header received. Aborting download.")
                 return
             }
@@ -330,13 +333,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     // **OUT-OF-ORDER HANDLING**: BLE can deliver packets out of order.
     // We buffer out-of-order packets and reorder them before writing to payloadBuffer.
     private fun processPacket(packet: ByteArray) {
-        if (packet.size < 5) return 
+        if (packet.size < 5) {
+            Log.w(TAG, "processPacket: Packet too small (${packet.size} bytes), ignoring")
+            return 
+        }
 
         // Extract message type first (byte 0)
         val type = packet[0].toInt() and 0xFF
         
         // Extract sequence number (bytes 1-4, little endian)
         val seq = ByteBuffer.wrap(packet, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        
+        Log.d(TAG, "processPacket: type=0x${type.toString(16)}, seq=$seq, size=${packet.size}, receivedPacketCount=$receivedPacketCount, totalExpectedPackets=$totalExpectedPackets")
         
         // **STATE RESET FOR NON-DOWNLOAD MESSAGES**
         // File list (0x02), live telemetry (0x01), and settings (0x05) are single-message responses.
@@ -650,13 +658,19 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         isFiltering = (start > 0L || end > 0L)
         
         // Construct Command: 0x06 + 0x20 + [32 bytes filename]
-        val cleanName = filename.split("(")[0].trim()
+        // Clean filename: remove size info like "(27.6 KB)" and any trailing parentheses
+        var cleanName = filename.split("(")[0].trim()
+        // Also remove trailing closing parenthesis if present (e.g., "20251207_1)" -> "20251207_1")
+        cleanName = cleanName.trimEnd(')')
+        Log.d(TAG, "Cleaned filename: '$filename' -> '$cleanName'")
+        
         val nameBytes = cleanName.toByteArray(Charsets.US_ASCII)
         val command = ByteArray(34)
         command[0] = 0x06
         command[1] = 0x20
         for (i in nameBytes.indices) if (i < 32) command[i+2] = nameBytes[i]
         
+        Log.d(TAG, "Sending download command: type=0x06, filename='$cleanName' (${nameBytes.size} bytes)")
         writeData(command)
         
         // Arm Watchdog
@@ -719,8 +733,11 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val rawPacket = characteristic.value?.copyOf()
             if (rawPacket != null && rawPacket.isNotEmpty()) {
                 lastPacketTime = System.currentTimeMillis()
+                Log.d(TAG, "Received packet: size=${rawPacket.size}, type=0x${if (rawPacket.isNotEmpty()) String.format("%02x", rawPacket[0].toInt() and 0xFF) else "??"}, seq=${if (rawPacket.size >= 5) ByteBuffer.wrap(rawPacket, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int else "N/A"}")
                 // Fast handoff to processing thread
                 packetQueue.offer(rawPacket) 
+            } else {
+                Log.w(TAG, "Received empty or null packet from GATT")
             }
         }
     }
@@ -829,7 +846,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val c = bluetoothGatt?.getService(SERVICE_UUID)?.getCharacteristic(WRITE_CHAR_UUID)
             if (c != null) {
                 c.value = d
-                bluetoothGatt?.writeCharacteristic(c)
+                val writeResult = bluetoothGatt?.writeCharacteristic(c)
+                Log.d(TAG, "writeData: sent ${d.size} bytes, writeResult=$writeResult, commandType=0x${String.format("%02x", d[0].toInt() and 0xFF)}")
+            } else {
+                Log.e(TAG, "writeData: Write characteristic is null! Cannot send command.")
             }
         }
     }

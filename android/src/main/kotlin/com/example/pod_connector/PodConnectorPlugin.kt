@@ -276,9 +276,25 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                     }
                     
                     // 4. Completion Check
+                    // For single-packet messages (file list, settings, live telemetry), 
+                    // we need to check completion immediately after processing
                     if (totalExpectedPackets > 0 && receivedPacketCount >= totalExpectedPackets) {
                         Thread.sleep(50) // Small grace period for any stragglers
-                        if (packetQueue.isEmpty()) finishMessage()
+                        if (packetQueue.isEmpty()) {
+                            finishMessage()
+                        }
+                    }
+                    
+                    // Special handling for single-packet non-download messages
+                    // These complete immediately after the header packet is processed
+                    // Check this AFTER processing the packet so currentMessageType is set
+                    if (packet != null) {
+                        val isNonDownloadMsg = (currentMessageType == 0x01 || currentMessageType == 0x02 || currentMessageType == 0x05)
+                        if (isNonDownloadMsg && receivedPacketCount == 1 && totalExpectedPackets == 1) {
+                            // Single-packet message completed - finish immediately
+                            Log.d(TAG, "Single-packet non-download message completed - finishing immediately")
+                            finishMessage()
+                        }
                     }
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
@@ -323,9 +339,12 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         if (isNonDownloadMessage && receivedPacketCount > 0) {
             Log.d(TAG, "Non-download message (type=0x${type.toString(16)}) received - resetting download state")
             resetDownloadState()
+            // After reset, we need to re-check the packet size since receivedPacketCount is now 0
+            // Continue processing this packet as a new header packet
         }
         
         // Check for duplicate packets (after potential state reset)
+        // Note: After reset, receivedSequences is cleared, so this check is safe
         if (receivedSequences.contains(seq)) {
             Log.d(TAG, "Duplicate packet detected (seq=$seq), ignoring")
             return
@@ -391,8 +410,15 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             receivedPacketCount = 1
             nextExpectedSeq = 2 // Next packet should be seq=2
             
+            Log.d(TAG, "Header processed: type=0x${type.toString(16)}, seq=$seq, totalPackets=$totalExpectedPackets, payloadSize=${payloadBuffer.size()}")
+            
             // Try to flush any buffered packets that arrived before the header
             flushBufferedPackets()
+            
+            // For single-packet messages (file list, settings, live telemetry), 
+            // we're already complete after processing the header
+            // Note: We don't call finishMessage() here directly because it needs to happen
+            // on the processing thread, which will check completion in the next loop iteration
             
         } else {
             // --- PAYLOAD PACKET (seq >= 2) ---
@@ -622,6 +648,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         
         // FLUSH DATA TO FLUTTER HERE
         val finalBytes = payloadBuffer.toByteArray()
+        Log.d(TAG, "finishMessage: type=0x${currentMessageType.toString(16)}, size=${finalBytes.size}, packets=$receivedPacketCount/$totalExpectedPackets")
         mainHandler.post { payloadSink?.success(finalBytes) }
         
         // Cleanup for next file

@@ -30,7 +30,9 @@ import java.nio.ByteOrder
 import java.util.UUID
 import java.util.Calendar
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.TreeMap
 
 /**
  * **PodConnectorPlugin**
@@ -101,6 +103,19 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     @Volatile private var totalExpectedPackets = 0
     private var actualPacketSize = 0 // Auto-detected from first packet (usually ~240 bytes for MTU 512)
     private var currentMessageType = 0
+    private var nextExpectedSeq = 1 // Next sequence number we expect (1 = header packet)
+    
+    // --- OUT-OF-ORDER PACKET BUFFERING ---
+    // TreeMap to store out-of-order packets by sequence number
+    // Key: sequence number, Value: packet payload (without header)
+    private val outOfOrderBuffer = TreeMap<Int, ByteArray>()
+    
+    // Track which sequence numbers we've received (for duplicate detection)
+    private val receivedSequences = mutableSetOf<Int>()
+    
+    // Timeout for missing packets (milliseconds)
+    private val MISSING_PACKET_TIMEOUT_MS = 5000L
+    private var lastFlushTime = 0L
     
     // --- UI PROGRESS TRACKING ---
     private var totalFilesInPack = 1
@@ -237,22 +252,28 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
             while (isProcessing.get()) {
                 try {
-                    // Blocking wait for new data
-                    val packet = packetQueue.take() 
-                    if (actualPacketSize == 0) actualPacketSize = packet.size
+                    // Blocking wait for new data (with timeout to check for missing packets)
+                    val packet = packetQueue.poll(1000, TimeUnit.MILLISECONDS)
+                    
+                    if (packet != null) {
+                        if (actualPacketSize == 0) actualPacketSize = packet.size
 
-                    // 1. Reassemble
-                    processPacket(packet)
+                        // 1. Reassemble
+                        processPacket(packet)
 
-                    // 2. Smart Peek Logic
-                    // Once we have enough bytes (128), check timestamp to see if we should abort.
-                    if (isFiltering && currentMessageType == 0x03 && !isSmartPeekDone && payloadBuffer.size() >= 128) {
-                        performSmartPeek()
-                        isSmartPeekDone = true
+                        // 2. Smart Peek Logic
+                        // Once we have enough bytes (128), check timestamp to see if we should abort.
+                        if (isFiltering && currentMessageType == 0x03 && !isSmartPeekDone && payloadBuffer.size() >= 128) {
+                            performSmartPeek()
+                            isSmartPeekDone = true
+                        }
+
+                        // 3. UI Updates (throttled)
+                        updateProgressUI()
+                    } else {
+                        // Timeout occurred - check if we should flush buffered packets
+                        checkAndFlushOnTimeout()
                     }
-
-                    // 3. UI Updates (throttled)
-                    updateProgressUI()
                     
                     // 4. Completion Check
                     if (totalExpectedPackets > 0 && receivedPacketCount >= totalExpectedPackets) {
@@ -281,12 +302,36 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     // Packet 0: [Type][Seq][...][TotalPackets][...Header...] (9 bytes overhead)
     // Packet N: [Type][Seq][...Header...] (5 bytes overhead)
     // We must strip these headers to rebuild the clean binary file.
+    // 
+    // **OUT-OF-ORDER HANDLING**: BLE can deliver packets out of order.
+    // We buffer out-of-order packets and reorder them before writing to payloadBuffer.
     private fun processPacket(packet: ByteArray) {
         if (packet.size < 5) return 
 
+        // Extract sequence number (bytes 1-4, little endian)
+        val seq = ByteBuffer.wrap(packet, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        
+        // Check for duplicate packets
+        if (receivedSequences.contains(seq)) {
+            Log.d(TAG, "Duplicate packet detected (seq=$seq), ignoring")
+            return
+        }
+
         if (receivedPacketCount == 0) {
-            // --- HEADER PACKET (First one) ---
-            if (packet.size < 9) return
+            // --- HEADER PACKET (seq=1) ---
+            if (packet.size < 9) {
+                Log.w(TAG, "Packet too small for header (seq=$seq, size=${packet.size})")
+                return
+            }
+            
+            // Validate that this is actually the header packet (seq=1)
+            if (seq != 1) {
+                Log.w(TAG, "Expected header packet (seq=1), got seq=$seq. Buffering...")
+                // Buffer it and wait for the real header
+                outOfOrderBuffer[seq] = packet.copyOf()
+                receivedSequences.add(seq)
+                return
+            }
             
             val type = packet[0].toInt() and 0xFF
             currentMessageType = type
@@ -328,14 +373,100 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             if (packet.size > 9) {
                 payloadBuffer.write(packet, 9, packet.size - 9)
             }
+            
+            receivedSequences.add(seq)
             receivedPacketCount = 1
+            nextExpectedSeq = 2 // Next packet should be seq=2
+            
+            // Try to flush any buffered packets that arrived before the header
+            flushBufferedPackets()
             
         } else {
-            // --- PAYLOAD PACKET ---
-            if (packet.size > 5) {
-                payloadBuffer.write(packet, 5, packet.size - 5)
+            // --- PAYLOAD PACKET (seq >= 2) ---
+            if (seq == nextExpectedSeq) {
+                // Expected packet arrived in order
+                if (packet.size > 5) {
+                    payloadBuffer.write(packet, 5, packet.size - 5)
+                }
+                receivedSequences.add(seq)
+                receivedPacketCount++
+                nextExpectedSeq++
+                
+                // Flush any buffered packets that are now in order
+                flushBufferedPackets()
+                
+            } else if (seq > nextExpectedSeq) {
+                // Out-of-order packet - buffer it
+                Log.d(TAG, "Out-of-order packet: expected seq=$nextExpectedSeq, got seq=$seq. Buffering...")
+                outOfOrderBuffer[seq] = packet.copyOf()
+                receivedSequences.add(seq)
+                lastFlushTime = System.currentTimeMillis()
+                
+                // Check if we should flush despite gaps (timeout handling)
+                checkAndFlushOnTimeout()
+                
+            } else {
+                // seq < nextExpectedSeq - this is a duplicate or very old packet
+                Log.d(TAG, "Received old/duplicate packet: seq=$seq (expected >= $nextExpectedSeq), ignoring")
+            }
+        }
+    }
+    
+    /**
+     * Flush buffered packets that are now in order.
+     * Processes packets sequentially starting from nextExpectedSeq.
+     */
+    private fun flushBufferedPackets() {
+        while (outOfOrderBuffer.containsKey(nextExpectedSeq)) {
+            val bufferedPacket = outOfOrderBuffer.remove(nextExpectedSeq)!!
+            
+            if (bufferedPacket.size > 5) {
+                payloadBuffer.write(bufferedPacket, 5, bufferedPacket.size - 5)
             }
             receivedPacketCount++
+            nextExpectedSeq++
+        }
+    }
+    
+    /**
+     * Check if we should flush buffered packets despite gaps.
+     * If we've been waiting too long for missing packets, flush what we have.
+     */
+    private fun checkAndFlushOnTimeout() {
+        if (outOfOrderBuffer.isEmpty()) return
+        
+        val now = System.currentTimeMillis()
+        if (lastFlushTime > 0 && (now - lastFlushTime) > MISSING_PACKET_TIMEOUT_MS) {
+            // Find the lowest sequence number in the buffer
+            val lowestBufferedSeq = outOfOrderBuffer.firstKey()
+            
+            // If there's a significant gap, log a warning
+            val gapSize = lowestBufferedSeq - nextExpectedSeq
+            if (gapSize > 10) {
+                Log.w(TAG, "Missing packets detected: gap from seq=$nextExpectedSeq to seq=$lowestBufferedSeq (size=$gapSize). Flushing buffered packets after timeout.")
+            }
+            
+            // Flush all buffered packets in order (TreeMap maintains sorted order)
+            // This allows download to continue even if some packets are lost
+            val keysToProcess = outOfOrderBuffer.keys.toList()
+            var maxFlushedSeq = nextExpectedSeq - 1
+            
+            for (seq in keysToProcess) {
+                val bufferedPacket = outOfOrderBuffer.remove(seq)!!
+                if (bufferedPacket.size > 5) {
+                    payloadBuffer.write(bufferedPacket, 5, bufferedPacket.size - 5)
+                }
+                receivedPacketCount++
+                maxFlushedSeq = seq
+            }
+            
+            // Update nextExpectedSeq to skip the gap and continue from the highest flushed sequence
+            if (keysToProcess.isNotEmpty()) {
+                nextExpectedSeq = maxFlushedSeq + 1
+                Log.d(TAG, "Timeout flush complete. Skipped gap, continuing from seq=$nextExpectedSeq")
+            }
+            
+            lastFlushTime = 0 // Reset timeout
         }
     }
 
@@ -434,6 +565,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         isSmartPeekDone = false 
         lastUiUpdateTime = 0
         payloadBuffer.reset()
+        nextExpectedSeq = 1
+        outOfOrderBuffer.clear()
+        receivedSequences.clear()
+        lastFlushTime = 0
         
         updateNotification("Syncing Data", "File $currentFileIndex of $totalFilesInPack", true, calculateOverallPercent(0))
         
@@ -483,6 +618,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         totalExpectedPackets = 0
         payloadBuffer.reset()
         isSmartPeekDone = false
+        nextExpectedSeq = 1
+        outOfOrderBuffer.clear()
+        receivedSequences.clear()
+        lastFlushTime = 0
         
         // Send "Skipped" signal (0xDA) to Flutter so it moves to next file
         mainHandler.postDelayed({ payloadSink?.success(byteArrayOf(0xDA.toByte())) }, 600)

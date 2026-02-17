@@ -85,8 +85,22 @@ class PodProtocolHandler {
   ///Filtering is NOT done here — it is handled by the notifier to avoid double-filtering.
   void _handleFileDownload(Uint8List rawBytes) {
     try {
+      // Diagnostic logging: show byte count and first few bytes for debugging
+      PodLogger.info('protocol', 'Parsing downloaded file', detail: 'Received ${rawBytes.length} bytes');
+      if (rawBytes.length > 0) {
+        final previewLength = rawBytes.length > 32 ? 32 : rawBytes.length;
+        final previewHex = rawBytes.sublist(0, previewLength).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+        PodLogger.info('protocol', 'First bytes preview', detail: '$previewHex${rawBytes.length > 32 ? "..." : ""}');
+      } else {
+        PodLogger.warn('protocol', 'Empty file received', detail: 'File download completed but payload is empty');
+      }
+
       // Parse binary data into raw SensorLog objects
       final rawLogs = BinaryParser.parseBytes(rawBytes);
+
+      if (rawLogs.isEmpty && rawBytes.length > 0) {
+        PodLogger.warn('protocol', 'Parser returned 0 entries', detail: 'Received ${rawBytes.length} bytes but no valid log entries found. File may be corrupted or format mismatch.');
+      }
 
       // Return raw List<SensorLog> to Notifier (filtering happens there)
       onMessageDecoded(PodMessage(

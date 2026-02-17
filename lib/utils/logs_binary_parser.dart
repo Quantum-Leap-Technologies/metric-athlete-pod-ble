@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'package:metric_athlete_pod_ble/models/sensor_log_model.dart';
+import 'package:metric_athlete_pod_ble/utils/pod_logger.dart';
 
 /// Class used to parse downloaded .bin file [rawBytes] into [SensorLog] objects.
 /// The [rawBytes] are expected to be in Little Endian format and consist of logs that are 64 bytes fixed size.
@@ -39,10 +40,15 @@ class BinaryParser {
     List<SensorLog> logs = [];
     final ByteData data = ByteData.sublistView(rawBytes); 
     int offset = 0; 
+    int invalidYearCount = 0;
+    int invalidDateCount = 0;
+    int parseErrorCount = 0;
+    int totalAttempts = 0;
 
     // Loop through the rawBytes in 64 byte packets. 
     // We use (offset + packetSize) to ensure we don't read past the end of the file.
     while (offset + packetSize <= rawBytes.length) { 
+      totalAttempts++;
       
       // --- 1. SYNC CHECK (The Fix) ---
       // Before parsing, check if the Year is valid (e.g., 2022-2030).
@@ -54,6 +60,7 @@ class BinaryParser {
       bool isHeaderValid = (potentialYear >= 2022 && potentialYear <= 2030);
 
       if (!isHeaderValid) {
+        invalidYearCount++;
         offset++; // Move 1 byte forward to "hunt" for the next valid header.
         continue; 
       }
@@ -71,6 +78,7 @@ class BinaryParser {
 
         // Sanity Check for Date 
         if (month == 0 || month > 12 || day == 0 || day > 31) {
+           invalidDateCount++;
            offset++; 
            continue;
         }
@@ -115,9 +123,21 @@ class BinaryParser {
 
       } catch (e) {
         // If parsing crashes (e.g., out of bounds), move 1 byte and try again
+        parseErrorCount++;
         offset++;
       }
     }
+    
+    // Diagnostic logging when no entries found
+    if (logs.isEmpty && rawBytes.length > 0) {
+      PodLogger.warn('parser', 'No valid entries found', detail: 
+        'Parsed ${rawBytes.length} bytes: $totalAttempts attempts, '
+        '$invalidYearCount invalid years, $invalidDateCount invalid dates, '
+        '$parseErrorCount parse errors. First 32 bytes: ${rawBytes.length > 32 ? rawBytes.sublist(0, 32).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ') : rawBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+    } else if (rawBytes.length == 0) {
+      PodLogger.warn('parser', 'Empty file received', detail: 'BinaryParser received 0 bytes');
+    }
+    
     return logs;
   }
 }

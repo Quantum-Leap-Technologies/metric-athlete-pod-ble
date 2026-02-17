@@ -312,15 +312,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val estimatedPayloadBytes = (totalExpectedPackets.toLong() * (safePacketSize - 5).toLong()) + 2048L
             val MAX_EXPECTED_BYTES = 256L * 1024L * 1024L // 256MB safety ceiling
             if (totalExpectedPackets <= 0 || estimatedPayloadBytes <= 0 || estimatedPayloadBytes > MAX_EXPECTED_BYTES) {
-                Log.e(TAG, "Invalid header. packets=$totalExpectedPackets estimatedBytes=$estimatedPayloadBytes — aborting download")
-                // Only abort+emit skip when we are actively downloading a file.
-                // Otherwise, just drop the packet to avoid disrupting telemetry / file list.
+                // Only log as error when actively downloading (user needs to know about download failure).
+                // When idle, this is likely stale/corrupted packets from previous operations or telemetry,
+                // so log at debug level to reduce noise while still allowing debugging if needed.
                 if (isDownloadActive) {
+                    Log.e(TAG, "Invalid header. packets=$totalExpectedPackets estimatedBytes=$estimatedPayloadBytes — aborting download")
                     // Abort the current download and emit the skip marker (0xDA) so Dart can
                     // continue to the next file instead of hanging on a never-finishing Future.
                     abortDownload("Invalid Header")
                 } else {
                     // Idle + invalid framed header -> drop packet (likely stale/corrupted chunk).
+                    // Log at debug level to reduce noise in production logs.
+                    Log.d(TAG, "Invalid header while idle (msgType=0x${currentMessageType.toString(16)}). packets=$totalExpectedPackets estimatedBytes=$estimatedPayloadBytes — dropping packet")
                     receivedPacketCount = 0
                     totalExpectedPackets = 0
                     messageStartSequence = 0L

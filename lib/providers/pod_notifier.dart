@@ -147,12 +147,27 @@ class PodNotifier extends Notifier<PodState> {
                }
 
                PodLogger.info('sync', 'Filter complete', detail: 'logs=${result.logs.length}, health=${result.healthScore.toInt()}%');
-               
-               state = state.copyWith(statusMessage: "Data Verified (Health: ${result.healthScore.toInt()}%)");
-               
-               // Complete the pending Future waiting in `downloadLogFile` with the SMOOTHED logs
+
+               // If strict trajectory filtering removes everything, fall back to raw logs so
+               // the caller can still perform timestamp-window filtering and avoid false "empty" failures.
+               final logsToReturn = result.logs.isNotEmpty ? result.logs : rawLogs;
+               if (result.logs.isEmpty) {
+                 PodLogger.warn(
+                   'sync',
+                   'Filter produced 0 logs; falling back to raw logs',
+                   detail: 'raw=${rawLogs.length}, health=${result.healthScore.toInt()}%',
+                 );
+               }
+
+               state = state.copyWith(
+                 statusMessage: result.logs.isNotEmpty
+                     ? "Data Verified (Health: ${result.healthScore.toInt()}%)"
+                     : "Data Verified (Raw Fallback)",
+               );
+
+               // Complete the pending Future waiting in `downloadLogFile`.
                if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-                 _syncCompleter!.complete(result.logs); 
+                 _syncCompleter!.complete(logsToReturn);
                }
 
              } catch (e) {

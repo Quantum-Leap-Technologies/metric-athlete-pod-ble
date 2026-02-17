@@ -101,6 +101,11 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     @Volatile private var totalExpectedPackets = 0
     private var actualPacketSize = 0 // Auto-detected from first packet (usually ~240 bytes for MTU 512)
     private var currentMessageType = 0
+    private var messageStartSequence = 0L
+
+    // True only while a file download request is in-flight.
+    // Used to decide whether to emit a skip marker (0xDA) on corrupted headers.
+    @Volatile private var isDownloadActive = false
     
     // --- UI PROGRESS TRACKING ---
     private var totalFilesInPack = 1
@@ -291,23 +296,42 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val type = packet[0].toInt() and 0xFF
             currentMessageType = type
 
+            // Sequence index is encoded in bytes 1..4 (little endian). Some firmware variants
+            // use a global sequence counter, so we track the start sequence dynamically.
+            val sequence = ByteBuffer.wrap(packet, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
+            messageStartSequence = sequence
+
             // Read Total Packets
             totalExpectedPackets = ByteBuffer.wrap(packet, 5, 4).order(ByteOrder.LITTLE_ENDIAN).int
 
-            // Guard against corrupted headers: cap at 500,000 packets (~32MB at 64B/packet)
-            val MAX_EXPECTED_PACKETS = 500_000
-            if (totalExpectedPackets <= 0 || totalExpectedPackets > MAX_EXPECTED_PACKETS) {
-                Log.e(TAG, "Invalid totalExpectedPackets: $totalExpectedPackets — aborting download")
-                totalExpectedPackets = 0
+            // Guard against corrupted headers.
+            // Use dynamic byte-size validation instead of a fixed packet-count cap, because
+            // packet counts vary significantly with negotiated MTU and valid downloads can
+            // exceed 500k packets on low-MTU links.
+            val safePacketSize = if (actualPacketSize > 5) actualPacketSize else 64
+            val estimatedPayloadBytes = (totalExpectedPackets.toLong() * (safePacketSize - 5).toLong()) + 2048L
+            val MAX_EXPECTED_BYTES = 256L * 1024L * 1024L // 256MB safety ceiling
+            if (totalExpectedPackets <= 0 || estimatedPayloadBytes <= 0 || estimatedPayloadBytes > MAX_EXPECTED_BYTES) {
+                Log.e(TAG, "Invalid header. packets=$totalExpectedPackets estimatedBytes=$estimatedPayloadBytes — aborting download")
+                // Only abort+emit skip when we are actively downloading a file.
+                // Otherwise, just drop the packet to avoid disrupting telemetry / file list.
+                if (isDownloadActive) {
+                    // Abort the current download and emit the skip marker (0xDA) so Dart can
+                    // continue to the next file instead of hanging on a never-finishing Future.
+                    abortDownload("Invalid Header")
+                } else {
+                    // Idle + invalid framed header -> drop packet (likely stale/corrupted chunk).
+                    receivedPacketCount = 0
+                    totalExpectedPackets = 0
+                    messageStartSequence = 0L
+                    payloadBuffer.reset()
+                }
                 return
             }
 
             // --- OPTIMIZATION: DYNAMIC MEMORY ALLOCATION ---
             // Use the 'actualPacketSize' variable (already captured in the thread loop).
             // This ensures we respect the dynamic MTU (e.g. 64 vs 247).
-            
-            // Safety: Ensure we don't calculate negative numbers if packet is tiny
-            val safePacketSize = if (actualPacketSize > 5) actualPacketSize else 64
             
             // Formula: Total Packets * (Payload Size) + Safety Buffer
             // Payload Size = Packet Size - 5 bytes (Type + Seq overhead)
@@ -332,6 +356,22 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             
         } else {
             // --- PAYLOAD PACKET ---
+            val packetType = packet[0].toInt() and 0xFF
+            if (packetType != currentMessageType) {
+                // Protect in-flight reassembly from interleaved packet streams (e.g. telemetry
+                // arriving while assembling file list/settings responses).
+                return
+            }
+
+            // Strict sequence validation is required for file download (0x03) integrity.
+            // For non-download framed messages (e.g., file list/settings), some firmware
+            // variants use different sequence semantics; we accept same-type packets in order.
+            if (currentMessageType == 0x03) {
+                val sequence = ByteBuffer.wrap(packet, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
+                val expectedSequence = (messageStartSequence + receivedPacketCount.toLong()) and 0xFFFFFFFFL
+                if (sequence != expectedSequence) return
+            }
+
             if (packet.size > 5) {
                 payloadBuffer.write(packet, 5, packet.size - 5)
             }
@@ -425,10 +465,12 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     // --- DOWNLOAD FLOW ---
     private fun startDownloadWithGatekeeper(filename: String, start: Long, end: Long) {
         stopWatchdog()
+        isDownloadActive = true
         // Reset State
         packetQueue.clear()
         receivedPacketCount = 0
         totalExpectedPackets = 0
+        messageStartSequence = 0L
         actualPacketSize = 0 
         lastPercent = -1
         isSmartPeekDone = false 
@@ -468,19 +510,23 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         mainHandler.post { payloadSink?.success(finalBytes) }
         
         // Cleanup for next file
+        isDownloadActive = false
         receivedPacketCount = 0
         totalExpectedPackets = 0
+        messageStartSequence = 0L
         payloadBuffer.reset()
     }
 
     private fun abortDownload(reason: String = "User Cancelled") {
         updateNotification("Syncing Data", "Skipping file...", true, calculateOverallPercent(100))
         stopWatchdog()
+        isDownloadActive = false
         writeData(byteArrayOf(0x08)) // Send Cancel Command (0x08)
         
         packetQueue.clear()
         receivedPacketCount = 0
         totalExpectedPackets = 0
+        messageStartSequence = 0L
         payloadBuffer.reset()
         isSmartPeekDone = false
         
@@ -513,9 +559,20 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             val rawPacket = characteristic.value?.copyOf()
             if (rawPacket != null && rawPacket.isNotEmpty()) {
+                val msgType = rawPacket[0].toInt() and 0xFF
+
+                // When a file download is active, only treat type 0x03 packets as download traffic.
+                // Other packets (telemetry, file list updates, etc.) can otherwise keep the watchdog alive
+                // and/or corrupt packet reassembly, causing the Dart Future to "load forever".
+                if (isDownloadActive && msgType != 0x03) {
+                    // Forward non-download packets directly to Dart and do NOT update watchdog time.
+                    mainHandler.post { payloadSink?.success(rawPacket) }
+                    return
+                }
+
+                // Download (or non-download when idle): update watchdog time + handoff to processing thread.
                 lastPacketTime = System.currentTimeMillis()
-                // Fast handoff to processing thread
-                packetQueue.offer(rawPacket) 
+                packetQueue.offer(rawPacket)
             }
         }
     }

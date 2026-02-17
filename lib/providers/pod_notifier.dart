@@ -42,7 +42,7 @@ class PodNotifier extends Notifier<PodState> {
   bool _isCancellingDownload = false; 
   
   // Buffer to hold live telemetry data during a recording session.
-  List<LiveTelemetry> _liveSessionBuffer = [];
+  final List<LiveTelemetry> _liveSessionBuffer = [];
   
   // Completer used to turn the listener-based download flow into a Future-based awaitable.
   // This allows the UI to 'await' a file download even though the data comes in asynchronously via streams.

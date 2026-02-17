@@ -44,6 +44,7 @@ class PodBLECore: NSObject {
     private var totalExpectedPackets = 0
     private var actualPacketSize = 0
     private var currentMessageType: UInt8 = 0
+    private var messageStartSequence: UInt32 = 0
 
     // Smart Peek filtering
     private var filterStart: Int64 = 0
@@ -58,6 +59,10 @@ class PodBLECore: NSObject {
     // Progress tracking
     private var totalFilesInPack = 1
     private var currentFileIndex = 1
+
+    // True only while a file download request is in-flight.
+    // Used to decide whether to emit a skip marker (0xDA) on corrupted headers.
+    private var isDownloadActive = false
 
     // MARK: - Initialization
 
@@ -153,6 +158,7 @@ class PodBLECore: NSObject {
     func downloadFile(filename: String, start: Int64, end: Int64, totalFiles: Int, currentIndex: Int) {
         stopWatchdog()
         resetDownloadState()
+        isDownloadActive = true
 
         totalFilesInPack = totalFiles
         currentFileIndex = currentIndex
@@ -184,6 +190,7 @@ class PodBLECore: NSObject {
         writeCommand(Data([0x08]))
 
         resetDownloadState()
+        isDownloadActive = false
 
         // Send skip signal (0xDA) to Flutter
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
@@ -203,13 +210,39 @@ class PodBLECore: NSObject {
             let type = packet[0]
             currentMessageType = type
 
+            // Sequence index is encoded in bytes 1..4 (little endian). Some firmware variants
+            // use a global sequence counter, so we track the start sequence dynamically.
+            let sequence = packet.subdata(in: 1..<5).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+            messageStartSequence = sequence
+
             // Read total expected packets (bytes 5-8, little endian)
             totalExpectedPackets = Int(packet.subdata(in: 5..<9).withUnsafeBytes {
                 $0.load(as: UInt32.self).littleEndian
             })
 
-            // Pre-allocate buffer
+            // Guard against corrupted headers.
+            // Use dynamic byte-size validation instead of a fixed packet-count cap, because
+            // packet counts vary with negotiated MTU and valid downloads can exceed 500k packets.
             let safePacketSize = max(actualPacketSize, 64)
+            let estimatedPayloadBytes = (Int64(totalExpectedPackets) * Int64(safePacketSize - 5)) + 2048
+            let maxExpectedBytes: Int64 = 256 * 1024 * 1024 // 256MB safety ceiling
+            if totalExpectedPackets <= 0 || estimatedPayloadBytes <= 0 || estimatedPayloadBytes > maxExpectedBytes {
+                // Only cancel+emit skip when we are actively downloading a file.
+                // Otherwise, drop the packet to avoid disrupting telemetry / file list.
+                if isDownloadActive {
+                    delegate?.didUpdateStatus("Invalid download header — skipping")
+                    cancelDownload()
+                } else {
+                    // Idle + invalid framed header -> drop packet (likely stale/corrupted chunk).
+                    receivedPacketCount = 0
+                    totalExpectedPackets = 0
+                    messageStartSequence = 0
+                    payloadBuffer = Data()
+                }
+                return
+            }
+
+            // Pre-allocate buffer
             let estimatedSize = totalExpectedPackets * (safePacketSize - 5) + 2048
             payloadBuffer = Data(capacity: estimatedSize)
 
@@ -222,6 +255,22 @@ class PodBLECore: NSObject {
 
         } else {
             // Subsequent packet
+            let packetType = packet[0]
+            if packetType != currentMessageType {
+                // Protect in-flight reassembly from interleaved packet streams (e.g. telemetry
+                // arriving while assembling file list/settings responses).
+                return
+            }
+
+            // Strict sequence validation is required for file download (0x03) integrity.
+            // For non-download framed messages (e.g., file list/settings), some firmware
+            // variants use different sequence semantics; we accept same-type packets in order.
+            if currentMessageType == 0x03 {
+                let sequence = packet.subdata(in: 1..<5).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+                let expectedSequence = messageStartSequence &+ UInt32(receivedPacketCount)
+                if sequence != expectedSequence { return }
+            }
+
             if packet.count > 5 {
                 payloadBuffer.append(packet.subdata(in: 5..<packet.count))
             }
@@ -301,8 +350,10 @@ class PodBLECore: NSObject {
         }
 
         // Reset for next file
+        isDownloadActive = false
         receivedPacketCount = 0
         totalExpectedPackets = 0
+        messageStartSequence = 0
         payloadBuffer = Data()
     }
 
@@ -348,6 +399,7 @@ class PodBLECore: NSObject {
     private func resetDownloadState() {
         receivedPacketCount = 0
         totalExpectedPackets = 0
+        messageStartSequence = 0
         actualPacketSize = 0
         isSmartPeekDone = false
         payloadBuffer = Data()
@@ -455,6 +507,16 @@ extension PodBLECore: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard characteristic.uuid == notifyCharUUID,
               let data = characteristic.value, !data.isEmpty else { return }
+
+        // When a file download is active, only treat type 0x03 packets as download traffic.
+        // Other packets (telemetry, file list updates, etc.) can keep the watchdog alive and/or
+        // corrupt reassembly, causing the Dart Future to "load forever".
+        if isDownloadActive, let first = data.first, first != 0x03 {
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.didReceivePayload(data)
+            }
+            return
+        }
 
         lastPacketTime = Date()
 

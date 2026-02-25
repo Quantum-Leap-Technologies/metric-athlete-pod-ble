@@ -533,6 +533,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             
             if (overallPercent != lastPercent) {
                 lastPercent = overallPercent
+                sendStatus("Downloading $filePercent%")
                 mainHandler.post {
                     updateNotification("Syncing Data", "Progress: $overallPercent%", true, overallPercent)
                 }

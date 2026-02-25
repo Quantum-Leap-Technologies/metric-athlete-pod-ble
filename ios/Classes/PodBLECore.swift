@@ -58,6 +58,7 @@ class PodBLECore: NSObject {
     // Progress tracking
     private var totalFilesInPack = 1
     private var currentFileIndex = 1
+    private var lastReportedProgress = -1
 
     // MARK: - Initialization
 
@@ -248,6 +249,15 @@ class PodBLECore: NSObject {
             isSmartPeekDone = true
         }
 
+        // Report download progress to Flutter
+        if totalExpectedPackets > 0 && receivedPacketCount > 0 {
+            let pct = min(Int((Double(receivedPacketCount) / Double(totalExpectedPackets)) * 100), 100)
+            if pct != lastReportedProgress && (pct == 1 || pct % 5 == 0 || receivedPacketCount >= totalExpectedPackets) {
+                lastReportedProgress = pct
+                delegate?.didUpdateStatus("Downloading \(pct)%")
+            }
+        }
+
         // Completion check
         if totalExpectedPackets > 0 && receivedPacketCount >= totalExpectedPackets {
             // Small grace period
@@ -359,6 +369,7 @@ class PodBLECore: NSObject {
         totalExpectedPackets = 0
         actualPacketSize = 0
         isSmartPeekDone = false
+        lastReportedProgress = -1
         payloadBuffer = Data()
     }
 

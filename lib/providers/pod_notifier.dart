@@ -241,10 +241,11 @@ class PodNotifier extends Notifier<PodState> {
   Future<void> startScan() async {
     // 1. Reset any existing timer to prevent bugs if user spams the button
     _scanTimer?.cancel();
+    debugPrint('[BLE-Plugin] startScan() called — platform=${Platform.operatingSystem}');
 
     // 2. Request Permissions (mobile only — desktop doesn't need runtime permissions)
     if (Platform.isAndroid) {
-      // Android 12+ (API 31) requires bluetoothScan + bluetoothConnect
+      debugPrint('[BLE-Plugin] Requesting Android permissions...');
       final statuses = await [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
@@ -252,22 +253,36 @@ class PodNotifier extends Notifier<PodState> {
         Permission.notification,
       ].request();
 
+      for (final entry in statuses.entries) {
+        debugPrint('[BLE-Plugin]   ${entry.key}: ${entry.value}');
+      }
+
       if (!statuses.values.every((s) => s.isGranted)) {
+        debugPrint('[BLE-Plugin] Android permissions denied — aborting');
         state = state.copyWith(statusMessage: "Permissions Denied.");
         return;
       }
     } else if (Platform.isIOS) {
-      // iOS uses Permission.bluetooth (maps to CBManagerAuthorization)
+      debugPrint('[BLE-Plugin] Requesting iOS permissions...');
       final statuses = await [
         Permission.bluetooth,
         Permission.locationWhenInUse,
       ].request();
 
+      for (final entry in statuses.entries) {
+        debugPrint('[BLE-Plugin]   ${entry.key}: ${entry.value}');
+      }
+
       if (!statuses.values.every((s) => s.isGranted)) {
+        debugPrint('[BLE-Plugin] iOS permissions denied — aborting');
         state = state.copyWith(statusMessage: "Permissions Denied.");
         return;
       }
+    } else {
+      debugPrint('[BLE-Plugin] Desktop — skipping permissions');
     }
+
+    debugPrint('[BLE-Plugin] Permissions OK — proceeding to scan');
 
     // --- BATTERY EXEMPTION REQUEST (Android only) ---
     await requestBatteryExemption();

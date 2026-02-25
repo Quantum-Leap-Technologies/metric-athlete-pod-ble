@@ -243,12 +243,24 @@ class PodNotifier extends Notifier<PodState> {
     _scanTimer?.cancel();
 
     // 2. Request Permissions (mobile only — desktop doesn't need runtime permissions)
-    if (Platform.isAndroid || Platform.isIOS) {
+    if (Platform.isAndroid) {
+      // Android 12+ (API 31) requires bluetoothScan + bluetoothConnect
       final statuses = await [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
         Permission.location,
         Permission.notification,
+      ].request();
+
+      if (!statuses.values.every((s) => s.isGranted)) {
+        state = state.copyWith(statusMessage: "Permissions Denied.");
+        return;
+      }
+    } else if (Platform.isIOS) {
+      // iOS uses Permission.bluetooth (maps to CBManagerAuthorization)
+      final statuses = await [
+        Permission.bluetooth,
+        Permission.locationWhenInUse,
       ].request();
 
       if (!statuses.values.every((s) => s.isGranted)) {

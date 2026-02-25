@@ -1,6 +1,6 @@
 # Metric Athlete Pod BLE - Bluetooth & Telemetry System
 
-**metric_athlete_pod_ble** is a high-performance Flutter plugin designed to interface with custom STM32/embedded GPS/IMU "Pod" devices over Bluetooth Low Energy. It handles high-frequency BLE telemetry, reliable file transfers, advanced trajectory data processing, and comprehensive session analytics.
+**metric_athlete_pod_ble** is a high-performance Flutter plugin designed to interface with custom STM32/embedded GPS/IMU "Pod" devices over Bluetooth Low Energy. It handles high-frequency BLE telemetry, reliable file transfers, and advanced trajectory data processing. Analytics computation is handled by the consuming app.
 
 **Supported Platforms:** Android, iOS, macOS, Windows
 
@@ -12,7 +12,7 @@
 * **Real-time Visualization:** Streams live accelerometer, gyroscope, and GPS data at 10Hz+.
 * **Advanced Data Cleaning:** Implements a 5-Stage Pipeline (Sanity Check -> Linear Interpolation -> Kalman+RTS -> Butterworth Low-Pass -> Outlier Rejection) to reconstruct timelines from lossy BLE data.
 * **Session Management:** Auto-clusters raw data into logical "Sessions" based on time gaps.
-* **Session Analytics:** Computes 30+ performance metrics including speed zones, player load, impacts, HMLD, fatigue index, and metabolic power estimates.
+* **Clean Data Delivery:** Delivers filtered, clustered `SensorLog` data to the consuming app for analytics computation.
 * **Structured Diagnostic Logging:** PodLogger with ring buffer (500 entries), severity levels, category filtering, and external listener hook.
 * **RSSI Signal Strength Tracking:** Real-time BLE signal quality monitoring in PodState.
 * **Clock Drift Detection:** Detects drift between pod RTC and device clock during sync.
@@ -57,7 +57,6 @@ Handles the "heavy lifting" of Bluetooth communication on each platform.
 * **`FilterPipeline`:** Unified orchestrator for all data processing stages (runs via `compute()` isolate).
 * **`TrajectoryFilter`:** Multi-stage post-processing engine that repairs and smooths sensor data (Sanity Check, Gap Repair, Kalman+RTS).
 * **`ButterworthFilter`:** 2nd-order zero-phase low-pass filter for IMU noise reduction.
-* **`StatsCalculator`:** Computes 30+ session metrics (distances, speed zones, impacts, player load, metabolic power).
 * **`PodLogger`:** Structured diagnostic logging with ring buffer, severity levels (debug/info/warn/error), and category filtering.
 
 ---
@@ -127,15 +126,6 @@ This stage restores the "Heartbeat" of the data. It detects gaps in the hardware
 ### Stage 4: Speed-Based Outlier Rejection
 * **Haversine Distance Check:** If GPS distance between consecutive 100ms samples exceeds the configurable threshold (default 1.0m), the position is replaced with a speed-inferred interpolation.
 
-### Session Analytics (`StatsCalculator`)
-After filtering, the `StatsCalculator` computes 30+ metrics from the clean data:
-* **Speed Zones:** Resting (<1.8), Walking (<7), Jogging (<18), Running (<25), Sprinting (>25 km/h).
-* **Distance Metrics:** Total, active, sprint, HSR (high-speed running), explosive.
-* **Load Metrics:** Player load, load score, session intensity, fatigue index.
-* **Impact Analysis:** Total impacts, max G-force, high-intensity events, impacts per speed zone.
-* **Metabolic Metrics** (weight-dependent): HMLD (High Metabolic Load Distance), energy expenditure, momentum peak, power play count.
-* **Data Quality:** GPS quality percentage, data gap count, health score.
-
 ### Diagnostic Logging (`PodLogger`)
 The plugin includes a structured logging system for BLE and sync diagnostics:
 * **Severity levels:** `debug`, `info`, `warn`, `error` via `PodLogger.debug(category, message)`, `.info(...)`, `.warn(...)`, `.error(...)`.
@@ -187,8 +177,6 @@ lib/
 │   ├── pod_state_model.dart       # Riverpod State (Scanning, Connected, etc.)
 │   ├── sensor_log_model.dart      # Decodes 64-byte file record (SensorLog)
 │   ├── session_block_model.dart   # Logical "Session" groupings
-│   ├── session_stats_model.dart   # 30+ computed metrics (SessionStats)
-│   ├── stats_input_model.dart     # Input config for StatsCalculator
 │   └── usb_bounds_model.dart      # USB-specific logic
 ├── providers/
 │   └── pod_notifier.dart          # Main Logic Controller (The Brain)
@@ -202,7 +190,6 @@ lib/
 │   ├── logs_binary_parser.dart    # Byte-level extraction logic
 │   ├── pod_protocol_decoder.dart  # Binary Packet Router
 │   ├── session_cluster.dart       # Logic to split runs by time gaps
-│   ├── stats_calculator.dart      # Session analytics engine (30+ metrics)
 │   ├── trajectory_filter.dart     # Sanity + Gap Repair + Kalman+RTS Filter
 │   └── usb_file_predictor.dart    # USB Prediction Logic
 ├── metric_athlete_pod_ble.dart    # Barrel file (all public exports)

@@ -208,6 +208,15 @@ class PodBLECore: NSObject {
                 $0.load(as: UInt32.self).littleEndian
             })
 
+            // Sanity check — reject obviously corrupt headers.
+            // A 2-hour session at 10 Hz ≈ 72 000 entries × ~64 bytes ≈ 72 000 packets.
+            // Cap at 500 000 to allow headroom but prevent multi-GB allocations.
+            let maxReasonablePackets = 500_000
+            guard totalExpectedPackets > 0 && totalExpectedPackets <= maxReasonablePackets else {
+                totalExpectedPackets = 0
+                return
+            }
+
             // Pre-allocate buffer
             let safePacketSize = max(actualPacketSize, 64)
             let estimatedSize = totalExpectedPackets * (safePacketSize - 5) + 2048

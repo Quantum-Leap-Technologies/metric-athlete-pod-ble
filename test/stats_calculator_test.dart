@@ -150,7 +150,21 @@ void main() {
     });
 
     test('player load accumulates for active session', () {
-      final logs = _generateMovingSession(durationSeconds: 30, speedKmh: 15.0);
+      // Boyd formula (√(Δax² + Δay² + Δaz²)) requires varying accel values
+      final base = DateTime(2025, 7, 25, 10, 0, 0);
+      final logs = List.generate(30, (i) {
+        final latStep = (15.0 / 3.6) / 111000.0;
+        return _log(
+          packetId: i * 100,
+          timestamp: base.add(Duration(seconds: i)),
+          lat: -33.8688 + (i * latStep),
+          lon: 151.2093,
+          speed: 15.0,
+          filtAx: 1.0 + (i % 3) * 0.5, // Varying accel to produce non-zero deltas
+          filtAy: 0.5 + (i % 2) * 0.3,
+          filtAz: 9.5 + (i % 4) * 0.2,
+        );
+      });
       final stats = StatsCalculator.analyzeLogs(logs);
       expect(stats.playerLoad, greaterThan(0));
     });

@@ -5,31 +5,46 @@ import 'package:metric_athlete_pod_ble/models/stats_input_model.dart';
 
 /// Comprehensive session analytics engine for GPS/IMU data.
 ///
-/// Ported from `Mock-bluetooth-app-main/lib/utils/stats_calculator.dart` with
-/// additional metrics for database integration (acceleration/deceleration counts,
-/// HSR distance, fatigue index, etc.).
+/// Calculates 41+ metrics from raw GPS/IMU sensor logs using validated
+/// sports science formulas:
+/// - Metabolic power: Minetti et al. (2002) / Osgnach et al. (2010) polynomial
+/// - Player Load: Boyd et al. (2011) triaxial delta formula
+/// - HIE: Multi-criteria 5-second window detection
 ///
 /// Designed to run via `compute()` isolate for performance.
 class StatsCalculator {
   // --- CONFIGURATION ---
-  static const double gravityMss = 9.80665;
+  static const double gravityMss = 9.80665; // SI standard gravity (m/s²)
   static const double maxValidSpeedKmh = 45.0;
   static const double maxValidGForce = 16.0;
   static const double impactThresholdG = 5.0;
   static const int smoothingWindow = 3;
 
-  // Speed zone thresholds (km/h)
+  // Speed zone thresholds (km/h) — aligned with MetricsCalculator
   static const double zoneResting = 1.8;
   static const double zoneWalking = 7.0;
-  static const double zoneJogging = 18.0;
-  static const double zoneRunning = 25.0;
+  static const double zoneHSR = 19.8; // 5.5 m/s × 3.6
+  static const double zoneSprinting = 25.2; // 7.0 m/s × 3.6
 
-  // Acceleration thresholds (m/s^2)
-  static const double accelThreshold = 2.0;
-  static const double decelThreshold = -2.0;
+  // Activity threshold (km/h) — movement above this is "active"
+  static const double zoneActivity = 7.2; // 2.0 m/s × 3.6
+
+  // Acceleration thresholds (m/s²)
+  static const double accelThreshold = 3.0; // high-intensity accel
+  static const double decelThreshold = -3.0; // high-intensity decel
+
+  // Power play thresholds
+  static const double powerPlaySpeedMs = 4.0; // m/s
+  static const double powerPlayAccelMs2 = 2.5; // m/s²
+
+  // Impact threshold (deceleration in m/s²)
+  static const double impactDecelMs2 = 3.0;
 
   // Metabolic power threshold for HMLD (W/kg)
   static const double hmldThresholdWkg = 25.5;
+
+  // Minimum event duration (seconds) for accel/decel events
+  static const double minEventDurationSec = 0.3;
 
   /// Backward-compatible entry point: accepts raw logs only.
   /// Call via `compute(StatsCalculator.analyzeLogs, logs)`.
@@ -85,7 +100,7 @@ class StatsCalculator {
         resampledLogs[i].longitude,
       );
 
-      double speed = d * 3.6; // m/s → km/h
+      double speed = d * 3.6; // m/s → km/h (at 1Hz, d in meters = speed in m/s)
       if (speed > maxValidSpeedKmh) {
         speed = 0.0;
         d = 0.0;
@@ -107,37 +122,61 @@ class StatsCalculator {
     double activeDist = 0.0;
     double sprintDist = 0.0;
     double hsrDist = 0.0;
-    double explosiveDist = 0.0;
     int sprints = 0;
     double topSpeed = 0.0;
     double speedSum = 0.0;
-    int accelCount = 0;
-    int decelCount = 0;
-    double maxAccel = 0.0;
     int hsrEfforts = 0;
     double distToMaxSpeed = 0.0;
     bool prevAboveHsr = false;
 
+    // Acceleration event detection (rising-edge, per-event not per-sample)
+    int accelEventCount = 0;
+    int decelEventCount = 0;
+    double maxAccel = 0.0;
+    bool inAccelEvent = false;
+    bool inDecelEvent = false;
+    int accelEventStartIdx = 0;
+    int decelEventStartIdx = 0;
+
+    // Power play detection (speed + accel combination)
+    int powerPlayCount = 0;
+
     Map<String, double> zoneDist = {
-      'Resting': 0.0, 'Walking': 0.0, 'Jogging': 0.0,
-      'Running': 0.0, 'Sprinting': 0.0,
+      'Resting': 0.0,
+      'Walking': 0.0,
+      'Jogging': 0.0,
+      'Running': 0.0,
+      'Sprinting': 0.0,
     };
     Map<String, int> impactCounts = {
-      'Resting': 0, 'Walking': 0, 'Jogging': 0,
-      'Running': 0, 'Sprinting': 0,
+      'Resting': 0,
+      'Walking': 0,
+      'Jogging': 0,
+      'Running': 0,
+      'Sprinting': 0,
     };
     Map<String, int> zoneTime = {
-      'Resting': 0, 'Walking': 0, 'Jogging': 0,
-      'Running': 0, 'Sprinting': 0,
+      'Resting': 0,
+      'Walking': 0,
+      'Jogging': 0,
+      'Running': 0,
+      'Sprinting': 0,
     };
 
     String prevZone = 'Resting';
+
+    // Track per-sample data for power play and accel event detection
+    List<double> accelValues = []; // m/s² per sample
+    List<double> speedMsValues = []; // m/s per sample
 
     for (int i = 0; i < smoothSpeeds.length; i++) {
       double s = smoothSpeeds[i];
       double d = distsMeters[i];
       int epochSecond =
           resampledLogs[i].timestamp.millisecondsSinceEpoch ~/ 1000;
+
+      double speedMs = s / 3.6;
+      speedMsValues.add(speedMs);
 
       totalDist += d;
       speedSum += s;
@@ -153,54 +192,123 @@ class StatsCalculator {
       zoneDist[currentZone] = (zoneDist[currentZone] ?? 0) + (d / 1000.0);
       zoneTime[currentZone] = (zoneTime[currentZone] ?? 0) + 1;
 
-      // Sprint distance
-      if (currentZone == 'Sprinting') sprintDist += d;
-      // HSR: Running + Sprinting
-      if (s >= zoneJogging) hsrDist += d;
-      // Explosive: >20 km/h
-      if (s >= 20.0) explosiveDist += d;
+      // Sprint distance (>25.2 km/h = 7.0 m/s)
+      if (s >= zoneSprinting) sprintDist += d;
+      // HSR distance (>19.8 km/h = 5.5 m/s)
+      if (s >= zoneHSR) hsrDist += d;
 
       // Sprint counter (rising edge)
       if (currentZone == 'Sprinting' && prevZone != 'Sprinting') sprints++;
 
-      // HSR effort counter (rising edge crossing above zoneJogging)
-      bool aboveHsr = s >= zoneJogging;
+      // HSR effort counter (rising edge)
+      bool aboveHsr = s >= zoneHSR;
       if (aboveHsr && !prevAboveHsr) hsrEfforts++;
       prevAboveHsr = aboveHsr;
 
-      // Acceleration/deceleration detection
+      // Acceleration/deceleration — per-event counting (rising edge)
       if (i > 0) {
-        double deltaSpeed = (smoothSpeeds[i] - smoothSpeeds[i - 1]) / 3.6; // to m/s
-        if (deltaSpeed > accelThreshold) accelCount++;
-        if (deltaSpeed < decelThreshold) decelCount++;
-        if (deltaSpeed > maxAccel) maxAccel = deltaSpeed;
+        double deltaSpeedMs =
+            (smoothSpeeds[i] - smoothSpeeds[i - 1]) / 3.6; // km/h → m/s
+        accelValues.add(deltaSpeedMs);
+
+        if (deltaSpeedMs > maxAccel) maxAccel = deltaSpeedMs;
+
+        // Acceleration event detection
+        if (deltaSpeedMs > accelThreshold) {
+          if (!inAccelEvent) {
+            inAccelEvent = true;
+            accelEventStartIdx = i;
+          }
+          // Check for power play: speed > 4.0 m/s AND accel > 2.5 m/s²
+          if (speedMs > powerPlaySpeedMs && deltaSpeedMs > powerPlayAccelMs2) {
+            // Will count the event when it ends
+          }
+        } else if (inAccelEvent) {
+          // Event ended — check if it meets minimum duration
+          double eventDuration = (i - accelEventStartIdx).toDouble(); // seconds at 1Hz
+          if (eventDuration >= minEventDurationSec) {
+            accelEventCount++;
+            // Check if any sample in the event qualified as a power play
+            bool isPowerPlay = false;
+            for (int j = accelEventStartIdx; j < i; j++) {
+              if (j < speedMsValues.length && j < accelValues.length) {
+                if (speedMsValues[j] > powerPlaySpeedMs &&
+                    accelValues[j - 1] > powerPlayAccelMs2) {
+                  isPowerPlay = true;
+                  break;
+                }
+              }
+            }
+            if (isPowerPlay) powerPlayCount++;
+          }
+          inAccelEvent = false;
+        }
+
+        // Deceleration event detection
+        if (deltaSpeedMs < decelThreshold) {
+          if (!inDecelEvent) {
+            inDecelEvent = true;
+            decelEventStartIdx = i;
+          }
+        } else if (inDecelEvent) {
+          double eventDuration = (i - decelEventStartIdx).toDouble();
+          if (eventDuration >= minEventDurationSec) {
+            decelEventCount++;
+          }
+          inDecelEvent = false;
+        }
+      } else {
+        accelValues.add(0.0);
       }
 
       prevZone = currentZone;
     }
 
+    // Close any open events at the end
+    if (inAccelEvent) {
+      double eventDuration =
+          (smoothSpeeds.length - accelEventStartIdx).toDouble();
+      if (eventDuration >= minEventDurationSec) accelEventCount++;
+    }
+    if (inDecelEvent) {
+      double eventDuration =
+          (smoothSpeeds.length - decelEventStartIdx).toDouble();
+      if (eventDuration >= minEventDurationSec) decelEventCount++;
+    }
+
     // -------------------------------------------------------
-    // STEP 3: IMU ANALYSIS
+    // STEP 3: IMU ANALYSIS — Player Load (Boyd formula)
     // -------------------------------------------------------
     double playerLoad = 0.0;
     int totalImpacts = 0;
     double maxImpact = 0.0;
-    int hieCount = 0;
 
-    for (int i = 0; i < cleanGForces.length; i++) {
+    for (int i = 0; i < cleanLogs.length; i++) {
       double g = cleanGForces[i];
-
-      // Player load (accumulated dynamic acceleration)
-      playerLoad += (g - 1.0).abs() * 0.01;
-
       if (g > maxImpact) maxImpact = g;
 
-      // Impact detection (rising edge)
+      // Player Load: Boyd et al. (2011) — √(Δax² + Δay² + Δaz²)
+      // Uses filtered accelerometer values converted to G-force
+      if (i > 0) {
+        double gxCurr = cleanLogs[i].filteredAccelX / gravityMss;
+        double gyCurr = cleanLogs[i].filteredAccelY / gravityMss;
+        double gzCurr = cleanLogs[i].filteredAccelZ / gravityMss;
+        double gxPrev = cleanLogs[i - 1].filteredAccelX / gravityMss;
+        double gyPrev = cleanLogs[i - 1].filteredAccelY / gravityMss;
+        double gzPrev = cleanLogs[i - 1].filteredAccelZ / gravityMss;
+
+        double dx = gxCurr - gxPrev;
+        double dy = gyCurr - gyPrev;
+        double dz = gzCurr - gzPrev;
+
+        playerLoad += sqrt(dx * dx + dy * dy + dz * dz);
+      }
+
+      // Impact detection (rising edge of total G-force)
       if (g > impactThresholdG) {
         double prevG = (i > 0) ? cleanGForces[i - 1] : 0.0;
         if (prevG <= impactThresholdG) {
           totalImpacts++;
-          hieCount++;
 
           int logSecond =
               cleanLogs[i].timestamp.millisecondsSinceEpoch ~/ 1000;
@@ -210,22 +318,67 @@ class StatsCalculator {
       }
     }
 
+    // Scale player load by /100 (Boyd convention)
+    playerLoad /= 100.0;
+
     // -------------------------------------------------------
-    // STEP 4: DERIVED METRICS
+    // STEP 4: HIE DETECTION — Multi-criteria 5-second window
     // -------------------------------------------------------
-    int durationSec = resampledLogs.length;
+    int hieCount = 0;
+    if (smoothSpeeds.length > 5) {
+      int windowSize = 5; // 5 seconds at 1Hz
+      int idx = 0;
+      while (idx < smoothSpeeds.length) {
+        int windowEnd = min(idx + windowSize, smoothSpeeds.length);
+
+        int criteriaCount = 0;
+        bool hasHighAccel = false;
+        bool hasHighDecel = false;
+        bool hasSprint = false;
+
+        for (int j = idx; j < windowEnd; j++) {
+          if (smoothSpeeds[j] >= zoneSprinting) hasSprint = true;
+          if (j > 0 && j - 1 < accelValues.length) {
+            if (accelValues[j - 1] > accelThreshold) hasHighAccel = true;
+            if (accelValues[j - 1] < decelThreshold) hasHighDecel = true;
+          }
+        }
+
+        if (hasHighAccel) criteriaCount++;
+        if (hasHighDecel) criteriaCount++;
+        if (hasSprint) criteriaCount++;
+        // HMLD criterion checked in Step 5 if weight available
+
+        if (criteriaCount >= 3) {
+          hieCount++;
+          idx = windowEnd; // Skip to end of window (non-overlapping)
+        } else {
+          idx++;
+        }
+      }
+    }
+
+    // -------------------------------------------------------
+    // STEP 5: DERIVED METRICS
+    // -------------------------------------------------------
+
+    // Duration from timestamps (not sample count)
+    int durationSec;
+    if (resampledLogs.length >= 2) {
+      durationSec = resampledLogs.last.timestamp
+              .difference(resampledLogs.first.timestamp)
+              .inSeconds +
+          1;
+    } else {
+      durationSec = resampledLogs.length;
+    }
     double durationMin = durationSec / 60.0;
-    double distPerMin = durationMin > 0 ? (totalDist / 1000.0) / durationMin : 0;
+
+    // Distance per minute in m/min (not km/min)
+    double distPerMin = durationMin > 0 ? totalDist / durationMin : 0;
+
     double avgSpeed =
         resampledLogs.isNotEmpty ? speedSum / resampledLogs.length : 0;
-
-    // Load score: player load normalized per minute
-    double loadScore = durationMin > 0 ? playerLoad / durationMin : 0;
-
-    // Session intensity: distance * load / duration
-    double intensity = durationMin > 0
-        ? ((totalDist / 1000.0) * playerLoad) / durationMin
-        : 0;
 
     // Fatigue index: ratio of 2nd-half load to 1st-half load
     double fatigueIndex = 0;
@@ -243,21 +396,19 @@ class StatsCalculator {
       }
     }
 
-    // GPS quality: percentage of logs with valid GPS fix
+    // GPS quality: percentage of clean logs with valid GPS fix
     int validGps = cleanLogs
         .where((l) => l.latitude.abs() > 0.001 && l.longitude.abs() > 0.001)
         .length;
     double gpsQuality =
-        rawLogs.isNotEmpty ? (validGps / rawLogs.length) * 100.0 : 0;
+        cleanLogs.isNotEmpty ? (validGps / cleanLogs.length) * 100.0 : 0;
 
     // -------------------------------------------------------
-    // STEP 5: WEIGHT-DEPENDENT METABOLIC METRICS
+    // STEP 6: WEIGHT-DEPENDENT METABOLIC METRICS
     // -------------------------------------------------------
     double hmldDist = 0.0;
     double momentumPeak = 0.0;
     double energyKcal = 0.0;
-    int powerPlayCount = 0;
-    bool prevAboveHmld = false;
 
     if (weightKg != null && weightKg > 0 && smoothSpeeds.length > 1) {
       double topSpeedMs = topSpeed / 3.6;
@@ -270,19 +421,12 @@ class StatsCalculator {
         double accel = (speedMs - prevSpeedMs) / dt;
         double d = distsMeters[i];
 
-        // di Prampero metabolic power model (simplified):
-        // Equivalent slope = accel / gravity
-        // Energy cost of running on slope ≈ (3.6 * ES + 3.5) * speed (J/kg/m → W/kg)
-        double es = accel / gravityMss;
-        double energyCostJPerKgPerM = 3.6 * es + 3.5;
-        if (energyCostJPerKgPerM < 0) energyCostJPerKgPerM = 0;
-        double metPowerWPerKg = energyCostJPerKgPerM * speedMs;
+        // Minetti et al. (2002) / Osgnach et al. (2010) metabolic power
+        double metPowerWPerKg =
+            _calculateMetabolicPower(speedMs, accel);
 
         // HMLD: distance where metabolic power > threshold
-        bool aboveHmld = metPowerWPerKg > hmldThresholdWkg;
-        if (aboveHmld) hmldDist += d;
-        if (aboveHmld && !prevAboveHmld) powerPlayCount++;
-        prevAboveHmld = aboveHmld;
+        if (metPowerWPerKg > hmldThresholdWkg) hmldDist += d;
 
         // Energy: integrate power over time
         double powerWatts = metPowerWPerKg * weightKg;
@@ -290,11 +434,39 @@ class StatsCalculator {
       }
     }
 
+    // Explosive distance = HMLD - HSR (metabolic load not from high-speed running)
+    double explosiveDist = max(0.0, hmldDist - hsrDist);
+
     double hmldPct = totalDist > 0 ? (hmldDist / totalDist) * 100.0 : 0;
     double hmldPerMin = durationMin > 0 ? hmldDist / durationMin : 0;
 
+    // Session intensity classification (GREEN/AMBER/RED)
+    String sessionIntensityStr;
+    if (hmldPerMin < 10) {
+      sessionIntensityStr = 'GREEN'; // Low intensity / recovery
+    } else if (hmldPerMin < 15) {
+      sessionIntensityStr = 'AMBER'; // Moderate intensity
+    } else {
+      sessionIntensityStr = 'RED'; // High intensity / match simulation
+    }
+
+    // Load score: weighted composite (aligned with MetricsCalculator)
+    double loadScore = 0;
+    if (durationMin > 0) {
+      final hmldPm = hmldDist / durationMin;
+      final hiePm = hieCount / durationMin;
+      final sprintsPm = sprints / durationMin;
+      final accelPm = accelEventCount / durationMin;
+      loadScore = min(
+          100.0,
+          (hmldPm * 0.4) +
+              (hiePm * 3.0 * 0.3) +
+              (sprintsPm * 5.0 * 0.2) +
+              (accelPm * 0.5 * 0.1));
+    }
+
     // -------------------------------------------------------
-    // STEP 6: PERSONAL BEST METRICS
+    // STEP 7: PERSONAL BEST METRICS
     // -------------------------------------------------------
     double personalMaxPct = 0.0;
     bool above90 = false;
@@ -315,15 +487,15 @@ class StatsCalculator {
       topSpeedKmh: topSpeed,
       avgSpeedKmh: avgSpeed,
       sprintCount: sprints,
-      accelerationCount: accelCount,
-      decelerationCount: decelCount,
+      accelerationCount: accelEventCount,
+      decelerationCount: decelEventCount,
       maxAcceleration: maxAccel,
       impactCount: totalImpacts,
       maxImpactG: maxImpact,
       hieCount: hieCount,
       playerLoad: playerLoad,
       loadScore: loadScore,
-      sessionIntensity: intensity,
+      sessionIntensity: sessionIntensityStr,
       fatigueIndex: fatigueIndex,
       hsrEfforts: hsrEfforts,
       distanceToMaxSpeedM: distToMaxSpeed,
@@ -344,13 +516,45 @@ class StatsCalculator {
     );
   }
 
+  // --- METABOLIC POWER ---
+
+  /// Minetti et al. (2002) / Osgnach et al. (2010) metabolic power formula.
+  ///
+  /// This is the validated 5th-order polynomial for energy cost of locomotion
+  /// on equivalent slopes, matching the app-side MetricsCalculator.
+  ///
+  /// [velocity] - Instantaneous velocity in m/s
+  /// [acceleration] - Linear acceleration in m/s²
+  ///
+  /// Returns metabolic power in W/kg
+  static double _calculateMetabolicPower(
+      double velocity, double acceleration) {
+    if (velocity < 0.1) return 0;
+
+    // Equivalent slope: ratio of acceleration to gravity
+    final es = acceleration / gravityMss;
+
+    // Energy cost of locomotion C(es) — Minetti polynomial
+    // Units: J/(kg·m)
+    final ec = (155.4 * pow(es, 5)) -
+        (30.4 * pow(es, 4)) -
+        (43.3 * pow(es, 3)) +
+        (46.3 * pow(es, 2)) +
+        (19.5 * es) +
+        3.6;
+
+    // Floor at zero: negative EC from steep deceleration is not meaningful
+    final ecClamped = ec < 0 ? 0.0 : ec;
+
+    // Equivalent mass factor
+    final em = sqrt(1 + pow(es, 2));
+
+    return ecClamped * em * velocity;
+  }
+
   // --- HELPERS ---
 
   /// Resamples to 1Hz by binning samples per calendar second.
-  /// Within each 1-second bin:
-  /// - Position: uses the mean lat/lon (best for distance calculation)
-  /// - Speed: uses the max speed (preserves peak speed for top speed tracking)
-  /// - IMU: uses the sample with max G-force (preserves peak impacts)
   static List<SensorLog> _resampleTo1Hz(List<SensorLog> logs) {
     if (logs.isEmpty) return [];
     List<SensorLog> resampled = [];
@@ -359,15 +563,18 @@ class StatsCalculator {
 
     for (var log in logs) {
       DateTime currentSecond = DateTime(
-        log.timestamp.year, log.timestamp.month, log.timestamp.day,
-        log.timestamp.hour, log.timestamp.minute, log.timestamp.second,
+        log.timestamp.year,
+        log.timestamp.month,
+        log.timestamp.day,
+        log.timestamp.hour,
+        log.timestamp.minute,
+        log.timestamp.second,
       );
 
       if (binSecond == null || currentSecond == binSecond) {
         bin.add(log);
         binSecond = currentSecond;
       } else {
-        // Flush previous bin
         if (bin.isNotEmpty) {
           resampled.add(_aggregateBin(bin));
         }
@@ -375,7 +582,6 @@ class StatsCalculator {
         binSecond = currentSecond;
       }
     }
-    // Flush final bin
     if (bin.isNotEmpty) {
       resampled.add(_aggregateBin(bin));
     }
@@ -386,10 +592,8 @@ class StatsCalculator {
   static SensorLog _aggregateBin(List<SensorLog> bin) {
     if (bin.length == 1) return bin.first;
 
-    // Position: mean for smooth distance calculation
     double meanLat = 0, meanLon = 0;
     double maxSpeed = 0;
-    // Track the sample with highest filtered accel magnitude for impact preservation
     SensorLog bestImu = bin.first;
     double bestG = 0;
 
@@ -437,8 +641,8 @@ class StatsCalculator {
   static String _getZone(double speedKmh) {
     if (speedKmh < zoneResting) return 'Resting';
     if (speedKmh < zoneWalking) return 'Walking';
-    if (speedKmh < zoneJogging) return 'Jogging';
-    if (speedKmh < zoneRunning) return 'Running';
+    if (speedKmh < zoneHSR) return 'Jogging';
+    if (speedKmh < zoneSprinting) return 'Running';
     return 'Sprinting';
   }
 

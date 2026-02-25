@@ -29,7 +29,7 @@ class SessionStats {
   // --- Load Metrics ---
   final double playerLoad;
   final double loadScore;
-  final double sessionIntensity;
+  final String sessionIntensity; // GREEN/AMBER/RED classification
   final double fatigueIndex;
 
   // --- HSR & Distance Metrics ---
@@ -42,7 +42,7 @@ class SessionStats {
   final double hmldPerMin; // HMLD per minute
   final double momentumPeak; // peak momentum = weight * max speed (kg·m/s)
   final double energyKcal; // estimated energy expenditure
-  final int powerPlayCount; // rising-edge count of metabolic power > 25.5 W/kg
+  final int powerPlayCount; // events where speed > 4.0 m/s AND accel > 2.5 m/s²
 
   // --- Personal Best Metrics ---
   final double personalMaxPercentage; // top speed as % of personal best
@@ -81,7 +81,7 @@ class SessionStats {
     this.hieCount = 0,
     this.playerLoad = 0,
     this.loadScore = 0,
-    this.sessionIntensity = 0,
+    this.sessionIntensity = '',
     this.fatigueIndex = 0,
     this.hsrEfforts = 0,
     this.distanceToMaxSpeedM = 0,
@@ -121,7 +121,7 @@ class SessionStats {
       hieCount: (map['hie_count'] as num?)?.toInt() ?? 0,
       playerLoad: (map['player_load'] as num?)?.toDouble() ?? 0,
       loadScore: (map['load_score'] as num?)?.toDouble() ?? 0,
-      sessionIntensity: (map['session_intensity'] as num?)?.toDouble() ?? 0,
+      sessionIntensity: (map['session_intensity'] as String?) ?? '',
       fatigueIndex: (map['fatigue_index'] as num?)?.toDouble() ?? 0,
       hsrEfforts: (map['hsr_efforts'] as num?)?.toInt() ?? 0,
       distanceToMaxSpeedM:
@@ -204,7 +204,7 @@ class SessionStats {
     int? hieCount,
     double? playerLoad,
     double? loadScore,
-    double? sessionIntensity,
+    String? sessionIntensity,
     double? fatigueIndex,
     int? hsrEfforts,
     double? distanceToMaxSpeedM,

@@ -205,6 +205,17 @@ class PodNotifier extends Notifier<PodState> {
   /// Sets up listeners for the native platform streams.
   void _setupNativeListeners() {
     _statusSub = _native.statusStream.listen((status) {
+      // If Bluetooth is off/unauthorized while scanning, cancel scanning state
+      if (status == 'Bluetooth Off' ||
+          status == 'Bluetooth Unauthorized' ||
+          status == 'Bluetooth Unavailable') {
+        _scanTimer?.cancel();
+        state = state.copyWith(
+          statusMessage: status,
+          isScanning: false,
+        );
+        return;
+      }
       state = state.copyWith(statusMessage: status);
       if (status == "Disconnected") _resetConnectionState();
     });
@@ -243,38 +254,18 @@ class PodNotifier extends Notifier<PodState> {
     _scanTimer?.cancel();
     debugPrint('[BLE-Plugin] startScan() called — platform=${Platform.operatingSystem}');
 
-    // 2. Request Permissions (mobile only — desktop doesn't need runtime permissions)
+    // 2. Check permissions (mobile only — callers are responsible for requesting)
     if (Platform.isAndroid) {
-      debugPrint('[BLE-Plugin] Requesting Android permissions...');
-      final statuses = await [
-        Permission.bluetoothScan,
-        Permission.bluetoothConnect,
-        Permission.location,
-        Permission.notification,
-      ].request();
-
-      for (final entry in statuses.entries) {
-        debugPrint('[BLE-Plugin]   ${entry.key}: ${entry.value}');
-      }
-
-      if (!statuses.values.every((s) => s.isGranted)) {
-        debugPrint('[BLE-Plugin] Android permissions denied — aborting');
+      final hasPerms = await Permission.bluetoothScan.isGranted;
+      debugPrint('[BLE-Plugin] Android bluetoothScan granted=$hasPerms');
+      if (!hasPerms) {
         state = state.copyWith(statusMessage: "Permissions Denied.");
         return;
       }
     } else if (Platform.isIOS) {
-      debugPrint('[BLE-Plugin] Requesting iOS permissions...');
-      final statuses = await [
-        Permission.bluetooth,
-        Permission.locationWhenInUse,
-      ].request();
-
-      for (final entry in statuses.entries) {
-        debugPrint('[BLE-Plugin]   ${entry.key}: ${entry.value}');
-      }
-
-      if (!statuses.values.every((s) => s.isGranted)) {
-        debugPrint('[BLE-Plugin] iOS permissions denied — aborting');
+      final hasPerms = await Permission.bluetooth.isGranted;
+      debugPrint('[BLE-Plugin] iOS bluetooth granted=$hasPerms');
+      if (!hasPerms) {
         state = state.copyWith(statusMessage: "Permissions Denied.");
         return;
       }

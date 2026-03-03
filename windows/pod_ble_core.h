@@ -13,6 +13,7 @@
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
+#include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <functional>
@@ -99,6 +100,7 @@ private:
 
     // Internal
     void ProcessPacket(const std::vector<uint8_t>& packet);
+    int DetectRecordSize(const std::vector<uint8_t>& buffer);
     void PerformSmartPeek();
     void FinishMessage();
     void ResetDownloadState();
@@ -107,6 +109,7 @@ private:
     int64_t SnapToStandardInterval(int64_t raw);
 
     // Async helpers
+    winrt::fire_and_forget CheckRadioAndScan();
     winrt::fire_and_forget ConnectAsync(uint64_t address);
     void OnAdvertisementReceived(BluetoothLEAdvertisementWatcher const& watcher,
                                   BluetoothLEAdvertisementReceivedEventArgs const& args);

@@ -15,8 +15,10 @@ import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri                 
 import android.os.*
@@ -152,6 +154,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         }
     }
 
+    // --- BLUETOOTH STATE RECEIVER ---
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                    BluetoothAdapter.STATE_OFF -> sendStatus("Bluetooth Off")
+                    BluetoothAdapter.STATE_ON -> sendStatus("Bluetooth Ready")
+                }
+            }
+        }
+    }
+
     // --- FLUTTER LIFECYCLE ---
     override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         context = binding.applicationContext
@@ -187,6 +201,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
+
+        // Register Bluetooth state change receiver
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        context.registerReceiver(bluetoothStateReceiver, filter)
     }
 
     // --- COMMAND HANDLER (Flutter -> Kotlin) ---
@@ -340,9 +358,23 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     /**
+     * Detect firmware record size from peek data (61 or 64 bytes).
+     * Checks if a valid record header exists at offset 61 (Proewe firmware).
+     */
+    private fun detectRecordSize(peekData: ByteArray): Int {
+        if (peekData.size >= 69) {
+            val year = ByteBuffer.wrap(peekData, 65, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+            val month = peekData[67].toInt() and 0xFF
+            val day = peekData[68].toInt() and 0xFF
+            if (year in 2022..2030 && month in 1..12 && day in 1..31) return 61
+        }
+        return 64
+    }
+
+    /**
      * **Smart Peek Algorithm**
      * Instead of downloading the whole file to check the date, we check the first 128 bytes.
-     * The first 64 bytes contain the File Header (Time, Size, etc.).
+     * The first record contains the File Header (Time, Size, etc.).
      * If the file time is outside the user's requested range, we send an ABORT command.
      */
     private fun performSmartPeek() {
@@ -364,14 +396,15 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             calendar.clear()
             calendar.set(yr, mon - 1, day, hr, min, sec)
             val startTime = calendar.timeInMillis
-            
-            // Estimate duration to check end time
+
+            // Estimate duration — detect record size to handle 61-byte (Proewe) and 64-byte (HTS) firmware
+            val recordSize = detectRecordSize(peekData)
             val t1 = ByteBuffer.wrap(peekData, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-            val t2 = ByteBuffer.wrap(peekData, 64, 4).order(ByteOrder.LITTLE_ENDIAN).int 
+            val t2 = ByteBuffer.wrap(peekData, recordSize, 4).order(ByteOrder.LITTLE_ENDIAN).int
             val interval = snapToStandardInterval((t2 - t1).toLong())
-            val ppp = (actualPacketSize - 5).toLong() 
-            val dur = ((totalExpectedPackets * ppp) / 64) * interval
-            
+            val ppp = (actualPacketSize - 5).toLong()
+            val dur = ((totalExpectedPackets * ppp) / recordSize) * interval
+
             // Filter Logic
             if ((filterEnd > 0 && startTime > filterEnd) || (filterStart > 0 && (startTime + dur) < filterStart)) {
                 abortDownload("Filtered Out")
@@ -583,7 +616,14 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private fun hasPermissions() = ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
 
     private fun startScanning() {
-        val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
+        if (bluetoothAdapter == null || bluetoothAdapter?.isEnabled != true) {
+            sendStatus("Bluetooth Off")
+            return
+        }
+        val scanner = bluetoothAdapter?.bluetoothLeScanner ?: run {
+            sendStatus("Bluetooth Off")
+            return
+        }
         if (hasPermissions()) {
             scanner.startScan(null, ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCallback)
             
@@ -632,6 +672,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
+        try { context.unregisterReceiver(bluetoothStateReceiver) } catch (_: Exception) {}
         val serviceIntent = Intent(context, PodForegroundService::class.java)
         serviceIntent.action = "STOP"
         context.startService(serviceIntent)

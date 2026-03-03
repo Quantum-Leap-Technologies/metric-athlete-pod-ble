@@ -35,6 +35,36 @@ void PodBLECore::SetCallbacks(StatusCallback status, ScanCallback scan, PayloadC
 // MARK: - Scanning
 
 void PodBLECore::StartScan() {
+    CheckRadioAndScan();
+}
+
+winrt::fire_and_forget PodBLECore::CheckRadioAndScan() {
+    // Check Bluetooth radio state before scanning (matches iOS/macOS/Android behaviour)
+    try {
+        auto radios = co_await Windows::Devices::Radios::Radio::GetRadiosAsync();
+
+        Windows::Devices::Radios::Radio btRadio{nullptr};
+        for (auto const& radio : radios) {
+            if (radio.Kind() == Windows::Devices::Radios::RadioKind::Bluetooth) {
+                btRadio = radio;
+                break;
+            }
+        }
+
+        if (btRadio == nullptr) {
+            if (on_status_) on_status_("Bluetooth Unavailable");
+            co_return;
+        }
+
+        if (btRadio.State() != Windows::Devices::Radios::RadioState::On) {
+            if (on_status_) on_status_("Bluetooth Off");
+            co_return;
+        }
+    } catch (...) {
+        // Radio API unavailable (older Windows) — proceed optimistically
+    }
+
+    // Radio is on — proceed with scan
     watcher_ = BluetoothLEAdvertisementWatcher();
     watcher_.ScanningMode(BluetoothLEScanningMode::Active);
 
@@ -302,6 +332,23 @@ void PodBLECore::ProcessPacket(const std::vector<uint8_t>& packet) {
     }
 }
 
+// Detect firmware record size from payload buffer (61 or 64 bytes).
+// Checks if a valid record header exists at offset 1+61=62 (Proewe firmware).
+// Buffer includes the 1-byte type prefix, so the second record header starts at 1+recordSize.
+int PodBLECore::DetectRecordSize(const std::vector<uint8_t>& buffer) {
+    // Need at least 1 (type) + 61 (first record) + 8 (header of second record) = 70 bytes
+    if (buffer.size() >= 70) {
+        // Second record at offset 62; year is 4 bytes into the record header
+        uint16_t year = buffer[66] | (buffer[67] << 8);
+        uint8_t month = buffer[68];
+        uint8_t day = buffer[69];
+        if (year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+            return 61;
+        }
+    }
+    return 64;
+}
+
 void PodBLECore::PerformSmartPeek() {
     if (payload_buffer_.size() < 129) return;
 
@@ -323,14 +370,16 @@ void PodBLECore::PerformSmartPeek() {
     tm_val.tm_sec = sec;
     int64_t startTimeMs = static_cast<int64_t>(mktime(&tm_val)) * 1000;
 
-    // Estimate duration
+    // Estimate duration — detect record size to handle 61-byte (Proewe) and 64-byte (HTS) firmware
+    int recordSize = DetectRecordSize(payload_buffer_);
+    int t2Offset = 1 + recordSize; // skip type byte + first record
     uint32_t t1 = payload_buffer_[1] | (payload_buffer_[2] << 8) |
                   (payload_buffer_[3] << 16) | (payload_buffer_[4] << 24);
-    uint32_t t2 = payload_buffer_[65] | (payload_buffer_[66] << 8) |
-                  (payload_buffer_[67] << 16) | (payload_buffer_[68] << 24);
+    uint32_t t2 = payload_buffer_[t2Offset] | (payload_buffer_[t2Offset + 1] << 8) |
+                  (payload_buffer_[t2Offset + 2] << 16) | (payload_buffer_[t2Offset + 3] << 24);
     int64_t interval = SnapToStandardInterval(static_cast<int64_t>(t2 - t1));
     int64_t ppp = std::max(actual_packet_size_ - 5, 59);
-    int64_t dur = (static_cast<int64_t>(total_expected_packets_) * ppp / 64) * interval;
+    int64_t dur = (static_cast<int64_t>(total_expected_packets_) * ppp / recordSize) * interval;
 
     if ((filter_end_ > 0 && startTimeMs > filter_end_) ||
         (filter_start_ > 0 && (startTimeMs + dur) < filter_start_)) {

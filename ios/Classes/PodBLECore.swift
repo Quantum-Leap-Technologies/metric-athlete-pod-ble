@@ -71,7 +71,14 @@ class PodBLECore: NSObject {
 
     func startScan() {
         guard centralManager.state == .poweredOn else {
-            delegate?.didUpdateStatus("Bluetooth Off")
+            switch centralManager.state {
+            case .unauthorized:
+                delegate?.didUpdateStatus("Bluetooth Unauthorized")
+            case .poweredOff:
+                delegate?.didUpdateStatus("Bluetooth Off")
+            default:
+                delegate?.didUpdateStatus("Bluetooth Unavailable")
+            }
             return
         }
 
@@ -269,6 +276,19 @@ class PodBLECore: NSObject {
 
     // MARK: - Smart Peek
 
+    /// Detect firmware record size from peek data (61 or 64 bytes).
+    /// Checks if a valid record header exists at offset 61 (Proewe firmware).
+    private func detectRecordSize(from data: Data) -> Int {
+        guard data.count >= 69 else { return 64 }
+        let year = Int(data.subdata(in: 65..<67).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian })
+        let month = Int(data[67])
+        let day = Int(data[68])
+        if year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+            return 61
+        }
+        return 64
+    }
+
     private func performSmartPeek() {
         guard payloadBuffer.count >= 129 else { return }
 
@@ -295,13 +315,14 @@ class PodBLECore: NSObject {
         guard let startDate = calendar.date(from: components) else { return }
         let startTimeMs = Int64(startDate.timeIntervalSince1970 * 1000)
 
-        // Estimate duration
+        // Estimate duration — detect record size to handle 61-byte (Proewe) and 64-byte (HTS) firmware
+        let recordSize = detectRecordSize(from: peekData)
         let t1 = Int(peekData.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
-        let t2 = Int(peekData.subdata(in: 64..<68).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
+        let t2 = Int(peekData.subdata(in: recordSize..<(recordSize + 4)).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
         let rawInterval = Int64(t2 - t1)
         let interval = snapToStandardInterval(rawInterval)
         let payloadPerPacket = Int64(max(actualPacketSize - 5, 59))
-        let dur = (Int64(totalExpectedPackets) * payloadPerPacket / 64) * interval
+        let dur = (Int64(totalExpectedPackets) * payloadPerPacket / Int64(recordSize)) * interval
 
         // Filter
         if (filterEnd > 0 && startTimeMs > filterEnd) || (filterStart > 0 && (startTimeMs + dur) < filterStart) {

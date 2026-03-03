@@ -144,6 +144,16 @@ winrt::fire_and_forget PodBLECore::ConnectAsync(uint64_t address) {
             co_return;
         }
 
+        // Subscribe to connection status changes to detect unexpected disconnects
+        connection_token_ = device_.ConnectionStatusChanged(
+            [this, alive = alive_](BluetoothLEDevice const&, auto const&) {
+                if (!alive->load()) return;
+                if (device_ != nullptr &&
+                    device_.ConnectionStatus() == BluetoothConnectionStatus::Disconnected) {
+                    Disconnect();
+                }
+            });
+
         PreventSleep();
 
         auto servicesResult = co_await device_.GetGattServicesForUuidAsync(SERVICE_UUID);
@@ -166,21 +176,27 @@ winrt::fire_and_forget PodBLECore::ConnectAsync(uint64_t address) {
                 GattClientCharacteristicConfigurationDescriptorValue::Notify);
 
             if (status == GattCommunicationStatus::Success) {
-                notify_char_.ValueChanged([this](auto const&, GattValueChangedEventArgs const& args) {
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    reader.ByteOrder(ByteOrder::LittleEndian);
-                    std::vector<uint8_t> data(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(data);
+                notify_token_ = notify_char_.ValueChanged(
+                    [this, alive = alive_](auto const&, GattValueChangedEventArgs const& args) {
+                    if (!alive->load()) return;
+                    try {
+                        auto reader = DataReader::FromBuffer(args.CharacteristicValue());
+                        reader.ByteOrder(ByteOrder::LittleEndian);
+                        std::vector<uint8_t> data(reader.UnconsumedBufferLength());
+                        reader.ReadBytes(data);
 
-                    {
-                        std::lock_guard<std::mutex> lock(mtx_);
-                        last_packet_time_ = std::chrono::steady_clock::now();
-                    }
+                        {
+                            std::lock_guard<std::mutex> lock(mtx_);
+                            last_packet_time_ = std::chrono::steady_clock::now();
+                        }
 
-                    if (total_expected_packets_ > 0 || received_packet_count_ == 0) {
-                        ProcessPacket(data);
-                    } else {
-                        if (on_payload_) on_payload_(data);
+                        if (total_expected_packets_ > 0 || received_packet_count_ == 0) {
+                            ProcessPacket(data);
+                        } else {
+                            if (on_payload_) on_payload_(data);
+                        }
+                    } catch (...) {
+                        // Device may have disconnected mid-notification
                     }
                 });
             }
@@ -208,11 +224,29 @@ void PodBLECore::Disconnect() {
     StopWatchdog();
     AllowSleep();
 
+    // Revoke event subscriptions BEFORE nullifying objects to prevent
+    // callbacks from firing on a cleaned-up state.
+    try {
+        if (notify_char_ != nullptr && notify_token_.value != 0) {
+            notify_char_.ValueChanged(notify_token_);
+            notify_token_ = {};
+        }
+    } catch (...) {}
+
+    try {
+        if (device_ != nullptr && connection_token_.value != 0) {
+            device_.ConnectionStatusChanged(connection_token_);
+            connection_token_ = {};
+        }
+    } catch (...) {}
+
     notify_char_ = nullptr;
     write_char_ = nullptr;
 
     if (device_ != nullptr) {
-        device_.Close();
+        try {
+            device_.Close();
+        } catch (...) {}
         device_ = nullptr;
     }
 
@@ -232,7 +266,12 @@ winrt::fire_and_forget PodBLECore::WriteCommand(const std::vector<uint8_t>& data
         auto buffer = writer.DetachBuffer();
 
         co_await write_char_.WriteValueAsync(buffer, GattWriteOption::WriteWithResponse);
-    } catch (...) {}
+    } catch (const winrt::hresult_error&) {
+        // Write failed — device likely disconnected
+        if (on_status_) on_status_("Write Error");
+    } catch (...) {
+        if (on_status_) on_status_("Write Error");
+    }
 }
 
 // MARK: - Download

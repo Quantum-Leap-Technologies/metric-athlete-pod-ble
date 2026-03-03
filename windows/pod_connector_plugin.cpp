@@ -5,7 +5,9 @@
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,7 +30,23 @@ void PodConnectorPlugin::RegisterWithRegistrar(
     registrar->AddPlugin(std::move(plugin));
 }
 
-PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registrar) {
+PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registrar)
+    : registrar_(registrar) {
+
+    // Capture HWND for dispatching BLE callbacks back to the platform thread.
+    // BLE events fire on WinRT thread-pool threads, but Flutter requires all
+    // EventSink calls on the platform (UI) thread.
+    auto view = registrar->GetView();
+    if (view) {
+        window_handle_ = FlutterDesktopViewGetHWND(view);
+    }
+
+    // Register a window proc delegate to handle our custom callback message.
+    proc_delegate_id_ = registrar->RegisterTopLevelWindowProcDelegate(
+        [this](HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+            return HandleWindowMessage(hwnd, msg, wparam, lparam);
+        });
+
     // Method Channel
     auto method_channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
         registrar->messenger(), "com.example.pod_connector/methods",
@@ -72,31 +90,67 @@ PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registra
     // Initialize BLE Core
     ble_core_ = std::make_unique<PodBLECore>();
     ble_core_->SetCallbacks(
-        // Status callback
+        // Status callback — dispatched to platform thread
         [this](const std::string& status) {
-            if (status_sink_) {
-                status_sink_->Success(flutter::EncodableValue(status));
-            }
+            PostToMainThread([this, status]() {
+                if (status_sink_) {
+                    status_sink_->Success(flutter::EncodableValue(status));
+                }
+            });
         },
-        // Scan callback
+        // Scan callback — dispatched to platform thread
         [this](const std::string& name, const std::string& id, int rssi) {
-            if (scan_sink_) {
-                flutter::EncodableMap device_map;
-                device_map[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
-                device_map[flutter::EncodableValue("id")] = flutter::EncodableValue(id);
-                device_map[flutter::EncodableValue("rssi")] = flutter::EncodableValue(rssi);
-                scan_sink_->Success(flutter::EncodableValue(device_map));
-            }
+            PostToMainThread([this, name, id, rssi]() {
+                if (scan_sink_) {
+                    flutter::EncodableMap device_map;
+                    device_map[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
+                    device_map[flutter::EncodableValue("id")] = flutter::EncodableValue(id);
+                    device_map[flutter::EncodableValue("rssi")] = flutter::EncodableValue(rssi);
+                    scan_sink_->Success(flutter::EncodableValue(device_map));
+                }
+            });
         },
-        // Payload callback
+        // Payload callback — dispatched to platform thread
         [this](const std::vector<uint8_t>& data) {
-            if (payload_sink_) {
-                payload_sink_->Success(flutter::EncodableValue(data));
-            }
+            PostToMainThread([this, data]() {
+                if (payload_sink_) {
+                    payload_sink_->Success(flutter::EncodableValue(data));
+                }
+            });
         });
 }
 
-PodConnectorPlugin::~PodConnectorPlugin() = default;
+PodConnectorPlugin::~PodConnectorPlugin() {
+    if (registrar_ && proc_delegate_id_ >= 0) {
+        registrar_->UnregisterTopLevelWindowProcDelegate(proc_delegate_id_);
+    }
+}
+
+void PodConnectorPlugin::PostToMainThread(std::function<void()> callback) {
+    if (window_handle_ == nullptr) {
+        // No window handle (headless?) — call directly as fallback
+        callback();
+        return;
+    }
+    auto* fn = new std::function<void()>(std::move(callback));
+    if (!PostMessage(window_handle_, kCallbackMessage,
+                     reinterpret_cast<WPARAM>(fn), 0)) {
+        delete fn;
+    }
+}
+
+std::optional<LRESULT> PodConnectorPlugin::HandleWindowMessage(
+    HWND /*hwnd*/, UINT message, WPARAM wparam, LPARAM /*lparam*/) {
+    if (message == kCallbackMessage) {
+        auto* fn = reinterpret_cast<std::function<void()>*>(wparam);
+        if (fn) {
+            (*fn)();
+            delete fn;
+        }
+        return 0;
+    }
+    return std::nullopt;
+}
 
 void PodConnectorPlugin::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,

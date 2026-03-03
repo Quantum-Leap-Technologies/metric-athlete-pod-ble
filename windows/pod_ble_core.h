@@ -72,6 +72,10 @@ private:
     GattCharacteristic write_char_{nullptr};
     GattCharacteristic notify_char_{nullptr};
 
+    // Event tokens for cleanup (revoke on disconnect)
+    winrt::event_token notify_token_{};
+    winrt::event_token connection_token_{};
+
     // Packet reassembly
     std::vector<uint8_t> payload_buffer_;
     int received_packet_count_ = 0;

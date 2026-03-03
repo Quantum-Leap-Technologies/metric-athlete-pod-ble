@@ -8,7 +8,9 @@
 
 #include "pod_ble_core.h"
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace pod_connector {
@@ -35,6 +37,17 @@ private:
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> status_sink_;
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> scan_sink_;
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> payload_sink_;
+
+    // Platform thread dispatch: BLE callbacks fire on WinRT background threads,
+    // but Flutter requires EventSink calls on the platform (UI) thread.
+    HWND window_handle_ = nullptr;
+    int proc_delegate_id_ = -1;
+    flutter::PluginRegistrarWindows* registrar_ = nullptr;
+    static constexpr UINT kCallbackMessage = WM_APP + 0x504F; // "PO" for Pod
+
+    void PostToMainThread(std::function<void()> callback);
+    std::optional<LRESULT> HandleWindowMessage(
+        HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 };
 
 // Stream handler template

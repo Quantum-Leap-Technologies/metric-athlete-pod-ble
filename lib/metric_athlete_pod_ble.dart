@@ -10,7 +10,11 @@ export 'models/usb_bounds_model.dart';
 // Providers
 export 'providers/pod_notifier.dart';
 
+// Transport
+export 'transport/packet_reassembler.dart';
+
 // Utils
+export 'utils/ble_command_queue.dart';
 export 'utils/logs_binary_parser.dart';
 export 'utils/usb_file_predictor.dart';
 export 'utils/trajectory_filter.dart';

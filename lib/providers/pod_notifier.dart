@@ -10,6 +10,7 @@ import 'package:metric_athlete_pod_ble/models/session_block_model.dart';
 import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:metric_athlete_pod_ble/utils/ble_command_queue.dart';
 import 'package:metric_athlete_pod_ble/utils/pod_protocol_decoder.dart';
 
 /// The central State Management class for the Pod Connector application.
@@ -22,7 +23,10 @@ import 'package:metric_athlete_pod_ble/utils/pod_protocol_decoder.dart';
 class PodNotifier extends Notifier<PodState> {
   // Connects to the native Kotlin/Swift interface for low-level Bluetooth operations.
   final _native = PodConnectorPlatform.instance;
-  
+
+  // Serial command queue to prevent overlapping BLE operations (crash-prone on WinRT)
+  final _commandQueue = BleCommandQueue();
+
   // Timer to sync UI with Native Scanner timeout
   Timer? _scanTimer;
   
@@ -205,15 +209,25 @@ class PodNotifier extends Notifier<PodState> {
   /// Sets up listeners for the native platform streams.
   void _setupNativeListeners() {
     _statusSub = _native.statusStream.listen((status) {
-      // If Bluetooth is off/unauthorized while scanning, cancel scanning state
+      // Bluetooth unavailability — cancel scanning and surface to UI
       if (status == 'Bluetooth Off' ||
           status == 'Bluetooth Unauthorized' ||
-          status == 'Bluetooth Unavailable') {
+          status == 'Bluetooth Unavailable' ||
+          status == 'Scan Failed' ||
+          status == 'Permissions Error') {
         _scanTimer?.cancel();
         state = state.copyWith(
           statusMessage: status,
           isScanning: false,
         );
+        return;
+      }
+      // Connection errors from native hardening — treat as disconnect
+      if (status == 'Service Discovery Error' ||
+          status == 'Characteristic Discovery Error' ||
+          status == 'Connection Lost') {
+        _resetConnectionState();
+        state = state.copyWith(statusMessage: status);
         return;
       }
       state = state.copyWith(statusMessage: status);
@@ -229,7 +243,8 @@ class PodNotifier extends Notifier<PodState> {
   /// Resets the connection state when the Pod disconnects.
   void _resetConnectionState() {
     _hasAutoConnected = false;
-    _liveSessionBuffer.clear(); 
+    _liveSessionBuffer.clear();
+    _commandQueue.clear();
 
     // Fail-safe: Kill any pending download futures so the UI doesn't hang forever
     if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
@@ -621,7 +636,9 @@ class PodNotifier extends Notifier<PodState> {
 
   Future<void> _write(List<int> bytes) async {
     try {
-      await _native.writeCommand(Uint8List.fromList(bytes));
+      await _commandQueue.enqueue(
+        () => _native.writeCommand(Uint8List.fromList(bytes)),
+      );
     } catch (e) {
       state = state.copyWith(statusMessage: "Write Error: $e");
     }

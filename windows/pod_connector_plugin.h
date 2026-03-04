@@ -9,7 +9,9 @@
 #include "pod_ble_core.h"
 
 #include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -33,6 +35,9 @@ private:
 
     std::unique_ptr<PodBLECore> ble_core_;
 
+    // Lifetime guard: checked by BLE callbacks before using sinks
+    std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
+
     // Event sinks
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> status_sink_;
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> scan_sink_;
@@ -44,6 +49,11 @@ private:
     int proc_delegate_id_ = -1;
     flutter::PluginRegistrarWindows* registrar_ = nullptr;
     static constexpr UINT kCallbackMessage = WM_APP + 0x504F; // "PO" for Pod
+
+    // Mutex-protected callback queue (swap-under-lock pattern).
+    // Eliminates heap-allocated std::function* passed via WPARAM.
+    std::mutex callback_mutex_;
+    std::list<std::function<void()>> queued_callbacks_;
 
     void PostToMainThread(std::function<void()> callback);
     std::optional<LRESULT> HandleWindowMessage(

@@ -89,18 +89,21 @@ PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registra
 
     // Initialize BLE Core
     ble_core_ = std::make_unique<PodBLECore>();
+    auto plugin_alive = alive_;
     ble_core_->SetCallbacks(
         // Status callback — dispatched to platform thread
-        [this](const std::string& status) {
-            PostToMainThread([this, status]() {
+        [this, plugin_alive](const std::string& status) {
+            PostToMainThread([this, status, alive = plugin_alive]() {
+                if (!alive->load()) return;
                 if (status_sink_) {
                     status_sink_->Success(flutter::EncodableValue(status));
                 }
             });
         },
         // Scan callback — dispatched to platform thread
-        [this](const std::string& name, const std::string& id, int rssi) {
-            PostToMainThread([this, name, id, rssi]() {
+        [this, plugin_alive](const std::string& name, const std::string& id, int rssi) {
+            PostToMainThread([this, name, id, rssi, alive = plugin_alive]() {
+                if (!alive->load()) return;
                 if (scan_sink_) {
                     flutter::EncodableMap device_map;
                     device_map[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
@@ -111,8 +114,9 @@ PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registra
             });
         },
         // Payload callback — dispatched to platform thread
-        [this](const std::vector<uint8_t>& data) {
-            PostToMainThread([this, data]() {
+        [this, plugin_alive](const std::vector<uint8_t>& data) {
+            PostToMainThread([this, data, alive = plugin_alive]() {
+                if (!alive->load()) return;
                 if (payload_sink_) {
                     payload_sink_->Success(flutter::EncodableValue(data));
                 }
@@ -121,6 +125,7 @@ PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registra
 }
 
 PodConnectorPlugin::~PodConnectorPlugin() {
+    alive_->store(false);
     if (registrar_ && proc_delegate_id_ >= 0) {
         registrar_->UnregisterTopLevelWindowProcDelegate(proc_delegate_id_);
     }
@@ -132,20 +137,25 @@ void PodConnectorPlugin::PostToMainThread(std::function<void()> callback) {
         callback();
         return;
     }
-    auto* fn = new std::function<void()>(std::move(callback));
-    if (!PostMessage(window_handle_, kCallbackMessage,
-                     reinterpret_cast<WPARAM>(fn), 0)) {
-        delete fn;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        queued_callbacks_.emplace_back(std::move(callback));
     }
+    PostMessage(window_handle_, kCallbackMessage, 0, 0);
 }
 
 std::optional<LRESULT> PodConnectorPlugin::HandleWindowMessage(
-    HWND /*hwnd*/, UINT message, WPARAM wparam, LPARAM /*lparam*/) {
+    HWND /*hwnd*/, UINT message, WPARAM /*wparam*/, LPARAM /*lparam*/) {
     if (message == kCallbackMessage) {
-        auto* fn = reinterpret_cast<std::function<void()>*>(wparam);
-        if (fn) {
-            (*fn)();
-            delete fn;
+        // Swap-under-lock: drain the queue atomically to avoid holding
+        // the mutex while executing callbacks
+        std::list<std::function<void()>> batch;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            std::swap(queued_callbacks_, batch);
+        }
+        for (auto& fn : batch) {
+            try { fn(); } catch (...) {}
         }
         return 0;
     }

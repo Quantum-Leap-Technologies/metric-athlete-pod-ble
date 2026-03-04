@@ -280,6 +280,19 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
                     break
+                } catch (e: SecurityException) {
+                    // BLE permissions revoked at runtime
+                    Log.e(TAG, "SecurityException — BLE permissions may have been revoked", e)
+                    sendStatus("Permissions Error")
+                    break
+                } catch (e: android.os.DeadObjectException) {
+                    // GATT server died
+                    Log.e(TAG, "DeadObjectException — GATT server died", e)
+                    sendStatus("Connection Lost")
+                    break
+                } catch (e: android.os.RemoteException) {
+                    // IPC failure
+                    Log.e(TAG, "RemoteException — IPC failure", e)
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in processing", e)
                 }

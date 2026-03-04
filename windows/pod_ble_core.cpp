@@ -35,6 +35,8 @@ void PodBLECore::SetCallbacks(StatusCallback status, ScanCallback scan, PayloadC
 // MARK: - Scanning
 
 void PodBLECore::StartScan() {
+    // Stop any existing watcher first to prevent overlapping watcher state
+    StopScan();
     CheckRadioAndScan();
 }
 
@@ -65,6 +67,9 @@ winrt::fire_and_forget PodBLECore::CheckRadioAndScan() {
     }
 
     // Radio is on — proceed with scan
+    // Guard: only create watcher if null (StopScan nullified it)
+    if (watcher_ != nullptr) co_return;
+
     watcher_ = BluetoothLEAdvertisementWatcher();
     watcher_.ScanningMode(BluetoothLEScanningMode::Active);
 
@@ -72,7 +77,13 @@ winrt::fire_and_forget PodBLECore::CheckRadioAndScan() {
         OnAdvertisementReceived(watcher, args);
     });
 
-    watcher_.Start();
+    try {
+        watcher_.Start();
+    } catch (...) {
+        watcher_ = nullptr;
+        if (on_status_) on_status_("Scan Failed");
+        co_return;
+    }
 
     if (on_status_) on_status_("Scanning...");
 
@@ -95,28 +106,31 @@ void PodBLECore::StopScan() {
 void PodBLECore::OnAdvertisementReceived(
     BluetoothLEAdvertisementWatcher const&,
     BluetoothLEAdvertisementReceivedEventArgs const& args) {
+    try {
+        auto adv = args.Advertisement();
+        auto localName = winrt::to_string(adv.LocalName());
 
-    auto adv = args.Advertisement();
-    auto localName = winrt::to_string(adv.LocalName());
+        // Filter for POD devices
+        std::string upperName = localName;
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(),
+            [](unsigned char c) -> char { return static_cast<char>(std::toupper(c)); });
+        if (upperName.find("POD") != 0) return;
 
-    // Filter for POD devices
-    std::string upperName = localName;
-    std::transform(upperName.begin(), upperName.end(), upperName.begin(),
-        [](unsigned char c) -> char { return static_cast<char>(std::toupper(c)); });
-    if (upperName.find("POD") != 0) return;
+        // Format BLE address as string
+        uint64_t addr = args.BluetoothAddress();
+        std::ostringstream ss;
+        ss << std::hex << std::setfill('0');
+        for (int i = 5; i >= 0; i--) {
+            ss << std::setw(2) << ((addr >> (i * 8)) & 0xFF);
+            if (i > 0) ss << ":";
+        }
 
-    // Format BLE address as string
-    uint64_t addr = args.BluetoothAddress();
-    std::ostringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (int i = 5; i >= 0; i--) {
-        ss << std::setw(2) << ((addr >> (i * 8)) & 0xFF);
-        if (i > 0) ss << ":";
-    }
-
-    if (on_scan_) {
-        on_scan_(localName, ss.str(), args.RawSignalStrengthInDBm());
-    }
+        if (on_scan_) {
+            on_scan_(localName, ss.str(), args.RawSignalStrengthInDBm());
+        }
+    } catch (const winrt::hresult_error&) {
+    } catch (const std::exception&) {
+    } catch (...) {}
 }
 
 // MARK: - Connection
@@ -148,65 +162,94 @@ winrt::fire_and_forget PodBLECore::ConnectAsync(uint64_t address) {
         connection_token_ = device_.ConnectionStatusChanged(
             [this, alive = alive_](BluetoothLEDevice const&, auto const&) {
                 if (!alive->load()) return;
-                if (device_ != nullptr &&
-                    device_.ConnectionStatus() == BluetoothConnectionStatus::Disconnected) {
-                    Disconnect();
-                }
+                try {
+                    if (device_ != nullptr &&
+                        device_.ConnectionStatus() == BluetoothConnectionStatus::Disconnected) {
+                        Disconnect();
+                    }
+                } catch (const winrt::hresult_error&) {
+                } catch (const std::exception&) {
+                } catch (...) {}
             });
 
         PreventSleep();
 
-        auto servicesResult = co_await device_.GetGattServicesForUuidAsync(SERVICE_UUID);
-        if (servicesResult.Status() != GattCommunicationStatus::Success ||
-            servicesResult.Services().Size() == 0) {
-            if (on_status_) on_status_("Service Not Found");
+        // Service discovery — wrapped in try-catch so one failing step
+        // doesn't crash the entire connection flow
+        try {
+            auto servicesResult = co_await device_.GetGattServicesForUuidAsync(SERVICE_UUID);
+            if (servicesResult.Status() != GattCommunicationStatus::Success ||
+                servicesResult.Services().Size() == 0) {
+                if (on_status_) on_status_("Service Not Found");
+                co_return;
+            }
+
+            auto service = servicesResult.Services().GetAt(0);
+
+            // Get Notify Characteristic
+            auto notifyResult = co_await service.GetCharacteristicsForUuidAsync(NOTIFY_CHAR_UUID);
+            if (notifyResult.Status() == GattCommunicationStatus::Success &&
+                notifyResult.Characteristics().Size() > 0) {
+                notify_char_ = notifyResult.Characteristics().GetAt(0);
+
+                // Enable notifications
+                auto status = co_await notify_char_.WriteClientCharacteristicConfigurationDescriptorAsync(
+                    GattClientCharacteristicConfigurationDescriptorValue::Notify);
+
+                if (status == GattCommunicationStatus::Success) {
+                    notify_token_ = notify_char_.ValueChanged(
+                        [this, alive = alive_](auto const&, GattValueChangedEventArgs const& args) {
+                        if (!alive->load()) return;
+                        try {
+                            auto reader = DataReader::FromBuffer(args.CharacteristicValue());
+                            reader.ByteOrder(ByteOrder::LittleEndian);
+                            std::vector<uint8_t> data(reader.UnconsumedBufferLength());
+                            reader.ReadBytes(data);
+
+                            {
+                                std::lock_guard<std::mutex> lock(mtx_);
+                                last_packet_time_ = std::chrono::steady_clock::now();
+                            }
+
+                            if (total_expected_packets_ > 0 || received_packet_count_ == 0) {
+                                ProcessPacket(data);
+                            } else {
+                                if (on_payload_) on_payload_(data);
+                            }
+                        } catch (const winrt::hresult_error&) {
+                        } catch (const std::exception&) {
+                        } catch (...) {}
+                    });
+                }
+            }
+
+            // Get Write Characteristic
+            auto writeResult = co_await service.GetCharacteristicsForUuidAsync(WRITE_CHAR_UUID);
+            if (writeResult.Status() == GattCommunicationStatus::Success &&
+                writeResult.Characteristics().Size() > 0) {
+                write_char_ = writeResult.Characteristics().GetAt(0);
+            }
+        } catch (const winrt::hresult_error&) {
+            if (on_status_) on_status_("Service Discovery Error");
+            co_return;
+        } catch (const std::exception&) {
+            if (on_status_) on_status_("Connection Error");
+            co_return;
+        } catch (...) {
+            if (on_status_) on_status_("Connection Error");
             co_return;
         }
 
-        auto service = servicesResult.Services().GetAt(0);
-
-        // Get Notify Characteristic
-        auto notifyResult = co_await service.GetCharacteristicsForUuidAsync(NOTIFY_CHAR_UUID);
-        if (notifyResult.Status() == GattCommunicationStatus::Success &&
-            notifyResult.Characteristics().Size() > 0) {
-            notify_char_ = notifyResult.Characteristics().GetAt(0);
-
-            // Enable notifications
-            auto status = co_await notify_char_.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify);
-
-            if (status == GattCommunicationStatus::Success) {
-                notify_token_ = notify_char_.ValueChanged(
-                    [this, alive = alive_](auto const&, GattValueChangedEventArgs const& args) {
-                    if (!alive->load()) return;
-                    try {
-                        auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                        reader.ByteOrder(ByteOrder::LittleEndian);
-                        std::vector<uint8_t> data(reader.UnconsumedBufferLength());
-                        reader.ReadBytes(data);
-
-                        {
-                            std::lock_guard<std::mutex> lock(mtx_);
-                            last_packet_time_ = std::chrono::steady_clock::now();
-                        }
-
-                        if (total_expected_packets_ > 0 || received_packet_count_ == 0) {
-                            ProcessPacket(data);
-                        } else {
-                            if (on_payload_) on_payload_(data);
-                        }
-                    } catch (...) {
-                        // Device may have disconnected mid-notification
-                    }
-                });
+        // MTU negotiation: establishing a GattSession can trigger MTU negotiation
+        // on some Windows adapters. We read the negotiated value for diagnostics.
+        try {
+            auto gattSession = co_await GattSession::FromDeviceIdAsync(device_.BluetoothDeviceId());
+            if (gattSession) {
+                // MaxPduSize() returns the negotiated MTU
+                (void)gattSession.MaxPduSize();
             }
-        }
-
-        // Get Write Characteristic
-        auto writeResult = co_await service.GetCharacteristicsForUuidAsync(WRITE_CHAR_UUID);
-        if (writeResult.Status() == GattCommunicationStatus::Success &&
-            writeResult.Characteristics().Size() > 0) {
-            write_char_ = writeResult.Characteristics().GetAt(0);
+        } catch (...) {
+            // MTU query is optional — continue without it
         }
 
         if (on_status_) on_status_("Connected");
@@ -217,10 +260,15 @@ winrt::fire_and_forget PodBLECore::ConnectAsync(uint64_t address) {
 
     } catch (const winrt::hresult_error&) {
         if (on_status_) on_status_("Connection Error");
+    } catch (...) {
+        if (on_status_) on_status_("Connection Error");
     }
 }
 
 void PodBLECore::Disconnect() {
+    // Guard against re-entrant calls (ConnectionStatusChanged → Disconnect → ...)
+    if (disconnecting_.exchange(true)) return;
+
     StopWatchdog();
     AllowSleep();
 
@@ -244,14 +292,13 @@ void PodBLECore::Disconnect() {
     write_char_ = nullptr;
 
     if (device_ != nullptr) {
-        try {
-            device_.Close();
-        } catch (...) {}
+        try { device_.Close(); } catch (...) {}
         device_ = nullptr;
     }
 
     ResetDownloadState();
     if (on_status_) on_status_("Disconnected");
+    disconnecting_.store(false);
 }
 
 // MARK: - Write
@@ -336,10 +383,25 @@ void PodBLECore::ProcessPacket(const std::vector<uint8_t>& packet) {
         total_expected_packets_ = static_cast<int>(
             packet[5] | (packet[6] << 8) | (packet[7] << 16) | (packet[8] << 24));
 
+        // Sanity check — reject obviously corrupt headers (matching iOS/macOS behaviour).
+        // A 2-hour session at 10 Hz ≈ 72 000 packets. Cap at 500 000 for headroom.
+        if (total_expected_packets_ <= 0 || total_expected_packets_ > 500000) {
+            total_expected_packets_ = 0;
+            return;
+        }
+
         int safeSize = std::max(actual_packet_size_, 64);
         int estimatedSize = total_expected_packets_ * (safeSize - 5) + 2048;
-        payload_buffer_.clear();
-        payload_buffer_.reserve(estimatedSize);
+        // Cap at 10 MB to prevent OOM from corrupted but in-range packet counts
+        constexpr int kMaxBufferSize = 10 * 1024 * 1024;
+        estimatedSize = std::min(estimatedSize, kMaxBufferSize);
+        try {
+            payload_buffer_.clear();
+            payload_buffer_.reserve(estimatedSize);
+        } catch (...) {
+            // Fall back to dynamic growth if allocation fails
+            payload_buffer_.clear();
+        }
 
         payload_buffer_.push_back(current_message_type_);
 
@@ -448,9 +510,10 @@ void PodBLECore::StartWatchdog() {
     StopWatchdog();
     watchdog_running_ = true;
 
-    watchdog_thread_ = std::thread([this]() {
-        while (watchdog_running_) {
+    watchdog_thread_ = std::thread([this, alive = alive_]() {
+        while (watchdog_running_.load() && alive->load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!alive->load()) return;
 
             std::chrono::steady_clock::time_point lpt;
             {

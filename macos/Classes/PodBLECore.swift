@@ -467,6 +467,10 @@ extension PodBLECore: CBCentralManagerDelegate {
 extension PodBLECore: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        if let error = error {
+            delegate?.didUpdateStatus("Service Discovery Error")
+            return
+        }
         guard let services = peripheral.services else { return }
         for service in services {
             if service.uuid == serviceUUID {
@@ -476,6 +480,10 @@ extension PodBLECore: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        if let error = error {
+            delegate?.didUpdateStatus("Characteristic Discovery Error")
+            return
+        }
         guard let characteristics = service.characteristics else { return }
 
         for char in characteristics {
@@ -494,6 +502,10 @@ extension PodBLECore: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            // Notification read failed — device may have disconnected
+            return
+        }
         guard characteristic.uuid == notifyCharUUID,
               let data = characteristic.value, !data.isEmpty else { return }
 

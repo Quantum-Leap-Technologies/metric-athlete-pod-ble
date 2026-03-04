@@ -13,6 +13,7 @@
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
+#include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.GattSession.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Storage.Streams.h>
 
@@ -97,6 +98,9 @@ private:
 
     // Lifetime guard: shared flag checked by detached threads before using `this`
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
+
+    // Re-entrancy guard for Disconnect (ConnectionStatusChanged → Disconnect → ...)
+    std::atomic<bool> disconnecting_{false};
 
     // Sleep prevention
     void PreventSleep();

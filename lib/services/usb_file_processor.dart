@@ -8,8 +8,47 @@ import 'package:metric_athlete_pod_ble/utils/logs_binary_parser.dart';
 import 'package:metric_athlete_pod_ble/utils/trajectory_filter.dart';
 import '../utils/usb_file_predictor.dart';
 ///Class containing functions to identify, filter and save .bin files to .csv files.
-///The .bin files need to follow the SensorLog fields and BinaryParser format to be valid. 
+///The .bin files need to follow the SensorLog fields and BinaryParser format to be valid.
 class UsbFileProcessor {
+
+  /// Parse and filter a single .bin file at [filePath].
+  ///
+  /// Runs the full pipeline: BinaryParser → sort → TrajectoryFilter (in
+  /// background isolate). Returns the cleaned [SensorLog] list ready for
+  /// conversion to GPS points.
+  ///
+  /// Throws if the file cannot be read or contains no valid sensor data.
+  static Future<List<SensorLog>> processFile(String filePath) async {
+    final file = File(filePath);
+    final bytes = await file.readAsBytes();
+    final rawLogs = BinaryParser.parseBytes(bytes);
+
+    if (rawLogs.isEmpty) {
+      throw Exception('No valid sensor data found in $filePath');
+    }
+
+    rawLogs.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    final filtered = await compute(TrajectoryFilter.process, rawLogs);
+
+    if (filtered.logs.isNotEmpty) {
+      return filtered.logs;
+    }
+
+    // Fallback: no GPS fix — return sanitised raw logs
+    final sanitised = rawLogs.where((l) {
+      return l.speed.isFinite &&
+          l.filteredAccelX.isFinite &&
+          l.filteredAccelY.isFinite &&
+          l.filteredAccelZ.isFinite;
+    }).toList();
+
+    if (sanitised.isEmpty) {
+      throw Exception('No valid sensor data after filtering');
+    }
+
+    return sanitised;
+  }
 
 ///Uses the [start] and [end] time to search for valid .bin files the user chooses through the file picker.
 ///The raw data is then extracted and filtered from the files and stored as a single csv file.

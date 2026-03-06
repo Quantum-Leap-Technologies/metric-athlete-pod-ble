@@ -60,6 +60,9 @@ class PodBLECore: NSObject {
     private var currentFileIndex = 1
     private var lastReportedProgress = -1
 
+    // Background task — keeps the app alive while downloading over BLE
+    private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
+
     // MARK: - Initialization
 
     override init() {
@@ -177,6 +180,9 @@ class PodBLECore: NSObject {
         filterEnd = end
         isFiltering = (start > 0 || end > 0)
 
+        // Request background execution time so iOS doesn't suspend us mid-download
+        beginBackgroundDownload()
+
         // Construct command: 0x06 + 0x20 + [32 bytes filename]
         let cleanName = filename.components(separatedBy: "(").first?.trimmingCharacters(in: .whitespaces) ?? filename
         var command = Data(count: 34)
@@ -192,6 +198,23 @@ class PodBLECore: NSObject {
         // Arm watchdog
         lastPacketTime = Date()
         startWatchdog()
+    }
+
+    // MARK: - Background Task
+
+    private func beginBackgroundDownload() {
+        endBackgroundDownload() // End any existing task first
+        backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "PodBLEDownload") { [weak self] in
+            // iOS is about to expire our time — clean up
+            self?.endBackgroundDownload()
+        }
+    }
+
+    private func endBackgroundDownload() {
+        if backgroundTaskId != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTaskId)
+            backgroundTaskId = .invalid
+        }
     }
 
     func cancelDownload() {
@@ -341,6 +364,7 @@ class PodBLECore: NSObject {
 
     private func finishMessage() {
         stopWatchdog()
+        endBackgroundDownload()
 
         let finalData = payloadBuffer
         DispatchQueue.main.async { [weak self] in
@@ -406,6 +430,7 @@ class PodBLECore: NSObject {
         writeCharacteristic = nil
         notifyCharacteristic = nil
         resetDownloadState()
+        endBackgroundDownload()
     }
 
     private func snapToStandardInterval(_ raw: Int64) -> Int64 {

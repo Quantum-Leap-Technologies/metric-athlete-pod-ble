@@ -19,9 +19,9 @@ class PodBLECore: NSObject {
     private let writeCharUUID = CBUUID(string: "FB4A9352-9BCD-4CC6-80E4-AE37D16FFBF1")  // Phone → Pod
 
     private let scanDurationSeconds: TimeInterval = 15
-    private let watchdogTimeoutSeconds: TimeInterval = 60
-    private let stuckThresholdSeconds: TimeInterval = 2.5
-    private let stuckProgressThreshold: Double = 0.98
+    private let watchdogTimeoutSeconds: TimeInterval = 300
+    private let stuckThresholdSeconds: TimeInterval = 10.0
+    private let stuckProgressThreshold: Double = 0.99
 
     // MARK: - Properties
 
@@ -64,7 +64,14 @@ class PodBLECore: NSObject {
 
     override init() {
         super.init()
-        centralManager = CBCentralManager(delegate: self, queue: bleQueue)
+        centralManager = CBCentralManager(
+            delegate: self,
+            queue: bleQueue,
+            options: [
+                CBCentralManagerOptionRestoreIdentifierKey: "com.metricathlete.pod-ble",
+                CBCentralManagerOptionShowPowerAlertKey: true,
+            ]
+        )
     }
 
     // MARK: - Scanning
@@ -419,6 +426,15 @@ class PodBLECore: NSObject {
 // MARK: - CBCentralManagerDelegate
 
 extension PodBLECore: CBCentralManagerDelegate {
+
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        // Restore peripherals after iOS relaunches the app in background
+        if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
+           let peripheral = peripherals.first {
+            connectedPeripheral = peripheral
+            peripheral.delegate = self
+        }
+    }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {

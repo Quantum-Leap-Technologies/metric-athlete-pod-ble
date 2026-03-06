@@ -19,9 +19,9 @@ class PodBLECore: NSObject {
     private let writeCharUUID = CBUUID(string: "FB4A9352-9BCD-4CC6-80E4-AE37D16FFBF1")  // Phone → Pod
 
     private let scanDurationSeconds: TimeInterval = 15
-    private let watchdogTimeoutSeconds: TimeInterval = 60
-    private let stuckThresholdSeconds: TimeInterval = 2.5
-    private let stuckProgressThreshold: Double = 0.98
+    private let watchdogTimeoutSeconds: TimeInterval = 300
+    private let stuckThresholdSeconds: TimeInterval = 10.0
+    private let stuckProgressThreshold: Double = 0.99
 
     // MARK: - Properties
 

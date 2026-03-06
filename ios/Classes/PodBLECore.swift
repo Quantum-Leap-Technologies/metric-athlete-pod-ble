@@ -493,12 +493,18 @@ extension PodBLECore: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        print("[PodBLE] Connection failed: \(error?.localizedDescription ?? "unknown")")
         delegate?.didUpdateStatus("Connection Failed")
         cleanupConnection()
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        delegate?.didUpdateStatus("Disconnected")
+        if let error = error {
+            print("[PodBLE] Disconnect error: \(error.localizedDescription) (code: \((error as NSError).code))")
+            delegate?.didUpdateStatus("Disconnected: \(error.localizedDescription)")
+        } else {
+            delegate?.didUpdateStatus("Disconnected")
+        }
         cleanupConnection()
     }
 }

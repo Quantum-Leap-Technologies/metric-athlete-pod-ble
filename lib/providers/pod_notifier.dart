@@ -625,6 +625,11 @@ class PodNotifier extends Notifier<PodState> {
         return result;
       } catch (e) {
         PodLogger.warn('sync', 'Download attempt failed', detail: 'attempt=${attempt + 1}: $e');
+        // Don't retry if the connection was lost — retries won't help
+        if (state.connectedDeviceId == null) {
+          PodLogger.warn('sync', 'Connection lost, skipping retries');
+          rethrow;
+        }
         if (attempt < maxRetries) {
           // Exponential backoff: 2s, 4s
           final delay = Duration(seconds: 2 * (attempt + 1));

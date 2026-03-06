@@ -55,6 +55,11 @@ class PodBLECore: NSObject {
     private var watchdogTimer: Timer?
     private var lastPacketTime: Date = Date()
 
+    // Keepalive — prevents BLE supervision timeout during
+    // long pauses when the pod is reading from flash storage
+    private var keepaliveTimer: Timer?
+    private let keepaliveIntervalSeconds: TimeInterval = 5.0
+
     // Progress tracking
     private var totalFilesInPack = 1
     private var currentFileIndex = 1
@@ -185,10 +190,12 @@ class PodBLECore: NSObject {
         // Arm watchdog
         lastPacketTime = Date()
         startWatchdog()
+        startKeepalive()
     }
 
     func cancelDownload() {
         stopWatchdog()
+        stopKeepalive()
         writeCommand(Data([0x08]))
 
         resetDownloadState()
@@ -334,6 +341,7 @@ class PodBLECore: NSObject {
 
     private func finishMessage() {
         stopWatchdog()
+        stopKeepalive()
 
         let finalData = payloadBuffer
         DispatchQueue.main.async { [weak self] in
@@ -383,6 +391,27 @@ class PodBLECore: NSObject {
         }
     }
 
+    // MARK: - Keepalive
+
+    private func startKeepalive() {
+        stopKeepalive()
+        DispatchQueue.main.async { [weak self] in
+            self?.keepaliveTimer = Timer.scheduledTimer(withTimeInterval: self?.keepaliveIntervalSeconds ?? 5.0, repeats: true) { [weak self] _ in
+                self?.bleQueue.async { [weak self] in
+                    guard let self = self, let peripheral = self.connectedPeripheral else { return }
+                    peripheral.readRSSI()
+                }
+            }
+        }
+    }
+
+    private func stopKeepalive() {
+        DispatchQueue.main.async { [weak self] in
+            self?.keepaliveTimer?.invalidate()
+            self?.keepaliveTimer = nil
+        }
+    }
+
     // MARK: - Helpers
 
     private func resetDownloadState() {
@@ -395,6 +424,7 @@ class PodBLECore: NSObject {
     }
 
     private func cleanupConnection() {
+        stopKeepalive()
         connectedPeripheral = nil
         writeCharacteristic = nil
         notifyCharacteristic = nil

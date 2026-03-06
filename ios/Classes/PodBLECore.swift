@@ -55,6 +55,11 @@ class PodBLECore: NSObject {
     private var watchdogTimer: Timer?
     private var lastPacketTime: Date = Date()
 
+    // Keepalive — prevents iOS supervision timeout (code 6) during
+    // long pauses when the pod is reading from flash storage
+    private var keepaliveTimer: Timer?
+    private let keepaliveIntervalSeconds: TimeInterval = 5.0
+
     // Progress tracking
     private var totalFilesInPack = 1
     private var currentFileIndex = 1
@@ -198,6 +203,9 @@ class PodBLECore: NSObject {
         // Arm watchdog
         lastPacketTime = Date()
         startWatchdog()
+
+        // Start keepalive pings to prevent supervision timeout
+        startKeepalive()
     }
 
     // MARK: - Background Task
@@ -364,6 +372,7 @@ class PodBLECore: NSObject {
 
     private func finishMessage() {
         stopWatchdog()
+        stopKeepalive()
         endBackgroundDownload()
 
         let finalData = payloadBuffer
@@ -414,6 +423,36 @@ class PodBLECore: NSObject {
         }
     }
 
+    // MARK: - Keepalive
+
+    /// Start sending periodic reads to prevent iOS BLE supervision timeout.
+    /// The pod's BLE stack responds to RSSI reads even while busy with flash I/O,
+    /// which keeps the connection alive.
+    private func startKeepalive() {
+        stopKeepalive()
+        DispatchQueue.main.async { [weak self] in
+            self?.keepaliveTimer = Timer.scheduledTimer(withTimeInterval: self?.keepaliveIntervalSeconds ?? 5.0, repeats: true) { [weak self] _ in
+                self?.sendKeepalive()
+            }
+        }
+    }
+
+    private func stopKeepalive() {
+        DispatchQueue.main.async { [weak self] in
+            self?.keepaliveTimer?.invalidate()
+            self?.keepaliveTimer = nil
+        }
+    }
+
+    private func sendKeepalive() {
+        bleQueue.async { [weak self] in
+            guard let self = self, let peripheral = self.connectedPeripheral else { return }
+            // Reading RSSI generates BLE traffic without interfering with the pod's
+            // data stream — it's handled by the BLE controller, not the pod firmware.
+            peripheral.readRSSI()
+        }
+    }
+
     // MARK: - Helpers
 
     private func resetDownloadState() {
@@ -430,6 +469,7 @@ class PodBLECore: NSObject {
         writeCharacteristic = nil
         notifyCharacteristic = nil
         resetDownloadState()
+        stopKeepalive()
         endBackgroundDownload()
     }
 

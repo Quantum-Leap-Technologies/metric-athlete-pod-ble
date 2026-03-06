@@ -278,10 +278,18 @@ class PodNotifier extends Notifier<PodState> {
         return;
       }
     } else if (Platform.isIOS) {
-      final hasPerms = await Permission.bluetooth.isGranted;
-      debugPrint('[BLE-Plugin] iOS bluetooth granted=$hasPerms');
-      if (!hasPerms) {
-        state = state.copyWith(statusMessage: "Permissions Denied.");
+      var permStatus = await Permission.bluetooth.status;
+      debugPrint('[BLE-Plugin] iOS bluetooth status=$permStatus');
+      // If not yet determined or denied, request permission
+      if (!permStatus.isGranted && !permStatus.isLimited && !permStatus.isRestricted) {
+        permStatus = await Permission.bluetooth.request();
+        debugPrint('[BLE-Plugin] iOS bluetooth after request=$permStatus');
+      }
+      // Only block on permanent denial — CoreBluetooth handles its own
+      // authorization and will surface "Bluetooth Unauthorized" via the
+      // native status stream if truly blocked.
+      if (permStatus.isPermanentlyDenied) {
+        state = state.copyWith(statusMessage: "Bluetooth permission denied. Enable in Settings.");
         return;
       }
     } else {

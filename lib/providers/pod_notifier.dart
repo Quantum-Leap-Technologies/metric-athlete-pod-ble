@@ -621,7 +621,7 @@ class PodNotifier extends Notifier<PodState> {
 
       try {
         await _native.downloadFile(fileInfo, startMillis, endMillis, totalFiles, currentIndex);
-        final result = await _syncCompleter!.future.timeout(const Duration(minutes: 15));
+        final result = await _syncCompleter!.future.timeout(const Duration(minutes: 45));
         return result;
       } catch (e) {
         PodLogger.warn('sync', 'Download attempt failed', detail: 'attempt=${attempt + 1}: $e');

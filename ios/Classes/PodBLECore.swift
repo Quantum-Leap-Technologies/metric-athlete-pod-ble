@@ -72,14 +72,7 @@ class PodBLECore: NSObject {
 
     override init() {
         super.init()
-        centralManager = CBCentralManager(
-            delegate: self,
-            queue: bleQueue,
-            options: [
-                CBCentralManagerOptionRestoreIdentifierKey: "com.metricathlete.pod-ble",
-                CBCentralManagerOptionShowPowerAlertKey: true,
-            ]
-        )
+        centralManager = CBCentralManager(delegate: self, queue: bleQueue)
     }
 
     // MARK: - Scanning
@@ -491,15 +484,6 @@ class PodBLECore: NSObject {
 // MARK: - CBCentralManagerDelegate
 
 extension PodBLECore: CBCentralManagerDelegate {
-
-    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        // Restore peripherals after iOS relaunches the app in background
-        if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
-           let peripheral = peripherals.first {
-            connectedPeripheral = peripheral
-            peripheral.delegate = self
-        }
-    }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {

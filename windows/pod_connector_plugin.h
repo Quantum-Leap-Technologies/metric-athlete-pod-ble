@@ -19,9 +19,11 @@ namespace pod_connector {
 
 class PodConnectorPlugin : public flutter::Plugin {
 public:
-    static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
+    static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar,
+                                      FlutterDesktopPluginRegistrarRef raw_registrar);
 
-    PodConnectorPlugin(flutter::PluginRegistrarWindows* registrar);
+    PodConnectorPlugin(flutter::PluginRegistrarWindows* registrar,
+                       FlutterDesktopPluginRegistrarRef raw_registrar);
     virtual ~PodConnectorPlugin();
 
     // Disallow copy and assign

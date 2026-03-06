@@ -25,20 +25,23 @@ int GetIntFromEncodableValue(const flutter::EncodableValue& value, int fallback)
 
 // static
 void PodConnectorPlugin::RegisterWithRegistrar(
-    flutter::PluginRegistrarWindows* registrar) {
-    auto plugin = std::make_unique<PodConnectorPlugin>(registrar);
+    flutter::PluginRegistrarWindows* registrar,
+    FlutterDesktopPluginRegistrarRef raw_registrar) {
+    auto plugin = std::make_unique<PodConnectorPlugin>(registrar, raw_registrar);
     registrar->AddPlugin(std::move(plugin));
 }
 
-PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registrar)
+PodConnectorPlugin::PodConnectorPlugin(flutter::PluginRegistrarWindows* registrar,
+                                       FlutterDesktopPluginRegistrarRef raw_registrar)
     : registrar_(registrar) {
 
     // Capture HWND for dispatching BLE callbacks back to the platform thread.
     // BLE events fire on WinRT thread-pool threads, but Flutter requires all
     // EventSink calls on the platform (UI) thread.
-    auto view = registrar->GetView();
-    if (view) {
-        window_handle_ = FlutterDesktopViewGetHWND(view);
+    // Use C API to get the view ref (Flutter 3.38+ changed the type signature).
+    auto view_ref = FlutterDesktopPluginRegistrarGetView(raw_registrar);
+    if (view_ref) {
+        window_handle_ = FlutterDesktopViewGetHWND(view_ref);
     }
 
     // Register a window proc delegate to handle our custom callback message.
@@ -238,5 +241,6 @@ void PodConnectorPluginCApiRegisterWithRegistrar(
     FlutterDesktopPluginRegistrarRef registrar) {
     pod_connector::PodConnectorPlugin::RegisterWithRegistrar(
         flutter::PluginRegistrarManager::GetInstance()
-            ->GetRegistrar<flutter::PluginRegistrarWindows>(registrar));
+            ->GetRegistrar<flutter::PluginRegistrarWindows>(registrar),
+        registrar);
 }

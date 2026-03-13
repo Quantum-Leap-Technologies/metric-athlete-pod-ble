@@ -45,6 +45,9 @@ class PodBLECore: NSObject {
     private var actualPacketSize = 0
     private var currentMessageType: UInt8 = 0
 
+    // Download state
+    private var isDownloadActive = false
+
     // Smart Peek filtering
     private var filterStart: Int64 = 0
     private var filterEnd: Int64 = 0
@@ -79,17 +82,23 @@ class PodBLECore: NSObject {
 
     func startScan() {
         guard centralManager.state == .poweredOn else {
+            let stateStr: String
             switch centralManager.state {
             case .unauthorized:
+                stateStr = "Unauthorized"
                 delegate?.didUpdateStatus("Bluetooth Unauthorized")
             case .poweredOff:
+                stateStr = "PoweredOff"
                 delegate?.didUpdateStatus("Bluetooth Off")
             default:
+                stateStr = "Unavailable(\(centralManager.state.rawValue))"
                 delegate?.didUpdateStatus("Bluetooth Unavailable")
             }
+            NSLog("[PodBLE] startScan blocked — BLE state=%@", stateStr)
             return
         }
 
+        NSLog("[PodBLE] startScan — scanning for POD devices (timeout=%.0fs)", scanDurationSeconds)
         isScanning = true
         centralManager.scanForPeripherals(withServices: nil, options: [
             CBCentralManagerScanOptionAllowDuplicatesKey: false
@@ -121,19 +130,24 @@ class PodBLECore: NSObject {
         // Find the peripheral by UUID
         let uuid = UUID(uuidString: deviceId)
         guard let uuid = uuid else {
+            NSLog("[PodBLE] connect — invalid device ID: %@", deviceId)
             delegate?.didUpdateStatus("Invalid Device ID")
             return
         }
+
+        NSLog("[PodBLE] connect — looking up peripheral %@", deviceId)
 
         // All CoreBluetooth operations must happen on bleQueue
         bleQueue.async { [weak self] in
             guard let self = self else { return }
             let peripherals = self.centralManager.retrievePeripherals(withIdentifiers: [uuid])
             guard let peripheral = peripherals.first else {
+                NSLog("[PodBLE] connect — peripheral not found for UUID %@", deviceId)
                 self.delegate?.didUpdateStatus("Device Not Found")
                 return
             }
 
+            NSLog("[PodBLE] connect — found peripheral '%@', initiating connection", peripheral.name ?? "unnamed")
             self.connectedPeripheral = peripheral
             peripheral.delegate = self
             self.centralManager.connect(peripheral, options: nil)
@@ -159,7 +173,15 @@ class PodBLECore: NSObject {
         bleQueue.async { [weak self] in
             guard let self = self,
                   let peripheral = self.connectedPeripheral,
-                  let characteristic = self.writeCharacteristic else { return }
+                  let characteristic = self.writeCharacteristic else {
+                if data.count > 0 {
+                    NSLog("[PodBLE] writeCommand — DROPPED cmd=0x%02X (%d bytes), no connection/characteristic", data[0], data.count)
+                }
+                return
+            }
+            if data.count > 0 {
+                NSLog("[PodBLE] writeCommand — cmd=0x%02X (%d bytes)", data[0], data.count)
+            }
             peripheral.writeValue(data, for: characteristic, type: .withResponse)
         }
     }
@@ -178,11 +200,18 @@ class PodBLECore: NSObject {
         filterEnd = end
         isFiltering = (start > 0 || end > 0)
 
+        let cleanName = filename.components(separatedBy: "(").first?.trimmingCharacters(in: .whitespaces) ?? filename
+
+        isDownloadActive = true
+
+        NSLog("[PodBLE] downloadFile — file='%@' (%d/%d), filter=%@, range=[%lld..%lld]",
+              cleanName, currentIndex, totalFiles,
+              isFiltering ? "ON" : "OFF", start, end)
+
         // Request background execution time so iOS doesn't suspend us mid-download
         beginBackgroundDownload()
 
         // Construct command: 0x06 + 0x20 + [32 bytes filename]
-        let cleanName = filename.components(separatedBy: "(").first?.trimmingCharacters(in: .whitespaces) ?? filename
         var command = Data(count: 34)
         command[0] = 0x06
         command[1] = 0x20
@@ -219,6 +248,8 @@ class PodBLECore: NSObject {
     }
 
     func cancelDownload() {
+        NSLog("[PodBLE] cancelDownload — received=%d/%d packets, buffer=%d bytes",
+              receivedPacketCount, totalExpectedPackets, payloadBuffer.count)
         stopWatchdog()
         writeCommand(Data([0x08]))
 
@@ -233,11 +264,17 @@ class PodBLECore: NSObject {
     // MARK: - Packet Reassembly
 
     private func processPacket(_ packet: Data) {
-        guard packet.count >= 5 else { return }
+        guard packet.count >= 5 else {
+            NSLog("[PodBLE] processPacket — DROPPED: too short (%d bytes)", packet.count)
+            return
+        }
 
         if receivedPacketCount == 0 {
             // First packet (header)
-            guard packet.count >= 9 else { return }
+            guard packet.count >= 9 else {
+                NSLog("[PodBLE] processPacket — DROPPED first packet: too short for header (%d bytes)", packet.count)
+                return
+            }
 
             let type = packet[0]
             currentMessageType = type
@@ -247,11 +284,15 @@ class PodBLECore: NSObject {
                 $0.load(as: UInt32.self).littleEndian
             })
 
+            NSLog("[PodBLE] processPacket — HEADER: type=0x%02X, expectedPackets=%d, packetSize=%d",
+                  type, totalExpectedPackets, packet.count)
+
             // Sanity check — reject obviously corrupt headers.
             // A 2-hour session at 10 Hz ≈ 72 000 entries × ~64 bytes ≈ 72 000 packets.
             // Cap at 500 000 to allow headroom but prevent multi-GB allocations.
             let maxReasonablePackets = 500_000
             guard totalExpectedPackets > 0 && totalExpectedPackets <= maxReasonablePackets else {
+                NSLog("[PodBLE] processPacket — REJECTED: unreasonable packet count %d (max=%d)", totalExpectedPackets, maxReasonablePackets)
                 totalExpectedPackets = 0
                 return
             }
@@ -310,13 +351,18 @@ class PodBLECore: NSObject {
     /// Detect firmware record size from peek data (61 or 64 bytes).
     /// Checks if a valid record header exists at offset 61 (Proewe firmware).
     private func detectRecordSize(from data: Data) -> Int {
-        guard data.count >= 69 else { return 64 }
+        guard data.count >= 69 else {
+            NSLog("[PodBLE] detectRecordSize — data too short (%d bytes), defaulting to 64", data.count)
+            return 64
+        }
         let year = Int(data.subdata(in: 65..<67).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian })
         let month = Int(data[67])
         let day = Int(data[68])
         if year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+            NSLog("[PodBLE] detectRecordSize — Proewe firmware (61-byte records), probe date=%d-%02d-%02d", year, month, day)
             return 61
         }
+        NSLog("[PodBLE] detectRecordSize — HTS firmware (64-byte records), probe values: year=%d month=%d day=%d", year, month, day)
         return 64
     }
 
@@ -343,7 +389,10 @@ class PodBLECore: NSObject {
         components.minute = min
         components.second = sec
 
-        guard let startDate = calendar.date(from: components) else { return }
+        guard let startDate = calendar.date(from: components) else {
+            NSLog("[PodBLE] smartPeek — FAILED to parse date: %d-%02d-%02d %02d:%02d:%02d", yr, mon, day, hr, min, sec)
+            return
+        }
         let startTimeMs = Int64(startDate.timeIntervalSince1970 * 1000)
 
         // Estimate duration — detect record size to handle 61-byte (Proewe) and 64-byte (HTS) firmware
@@ -355,9 +404,17 @@ class PodBLECore: NSObject {
         let payloadPerPacket = Int64(max(actualPacketSize - 5, 59))
         let dur = (Int64(totalExpectedPackets) * payloadPerPacket / Int64(recordSize)) * interval
 
+        NSLog("[PodBLE] smartPeek — fileDate=%d-%02d-%02d %02d:%02d:%02d, recordSize=%d, interval=%lldms (raw=%lld), estDuration=%lldms",
+              yr, mon, day, hr, min, sec, recordSize, interval, rawInterval, dur)
+        NSLog("[PodBLE] smartPeek — startMs=%lld, filterStart=%lld, filterEnd=%lld, endMs=%lld",
+              startTimeMs, filterStart, filterEnd, startTimeMs + dur)
+
         // Filter
         if (filterEnd > 0 && startTimeMs > filterEnd) || (filterStart > 0 && (startTimeMs + dur) < filterStart) {
+            NSLog("[PodBLE] smartPeek — SKIPPING file (outside filter range)")
             cancelDownload()
+        } else {
+            NSLog("[PodBLE] smartPeek — KEEPING file (within filter range)")
         }
     }
 
@@ -367,6 +424,9 @@ class PodBLECore: NSObject {
         stopWatchdog()
         stopKeepalive()
         endBackgroundDownload()
+
+        NSLog("[PodBLE] finishMessage — type=0x%02X, received=%d/%d packets, buffer=%d bytes",
+              currentMessageType, receivedPacketCount, totalExpectedPackets, payloadBuffer.count)
 
         let finalData = payloadBuffer
         DispatchQueue.main.async { [weak self] in
@@ -402,6 +462,7 @@ class PodBLECore: NSObject {
 
         // Hard timeout
         if totalExpectedPackets > 0 && elapsed > watchdogTimeoutSeconds {
+            NSLog("[PodBLE] watchdog — HARD TIMEOUT after %.1fs, received=%d/%d packets", elapsed, receivedPacketCount, totalExpectedPackets)
             finishMessage()
             return
         }
@@ -410,6 +471,7 @@ class PodBLECore: NSObject {
         if totalExpectedPackets > 0 && elapsed > stuckThresholdSeconds {
             let progress = Double(receivedPacketCount) / Double(totalExpectedPackets)
             if progress > stuckProgressThreshold {
+                NSLog("[PodBLE] watchdog — STUCK at %.1f%% for %.1fs, forcing finish", progress * 100, elapsed)
                 finishMessage()
                 return
             }
@@ -449,6 +511,7 @@ class PodBLECore: NSObject {
     // MARK: - Helpers
 
     private func resetDownloadState() {
+        isDownloadActive = false
         receivedPacketCount = 0
         totalExpectedPackets = 0
         actualPacketSize = 0
@@ -512,21 +575,27 @@ extension PodBLECore: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        NSLog("[PodBLE] didConnect — peripheral='%@' (%@)", peripheral.name ?? "unnamed", peripheral.identifier.uuidString)
         delegate?.didUpdateStatus("Connected")
         peripheral.discoverServices([serviceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        print("[PodBLE] Connection failed: \(error?.localizedDescription ?? "unknown")")
+        let errCode = (error as NSError?)?.code ?? -1
+        NSLog("[PodBLE] didFailToConnect — peripheral='%@', error='%@' (code=%d)",
+              peripheral.name ?? "unnamed", error?.localizedDescription ?? "unknown", errCode)
         delegate?.didUpdateStatus("Connection Failed")
         cleanupConnection()
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if let error = error {
-            print("[PodBLE] Disconnect error: \(error.localizedDescription) (code: \((error as NSError).code))")
+            let nsError = error as NSError
+            NSLog("[PodBLE] didDisconnect — peripheral='%@', error='%@' (code=%d, domain=%@)",
+                  peripheral.name ?? "unnamed", error.localizedDescription, nsError.code, nsError.domain)
             delegate?.didUpdateStatus("Disconnected: \(error.localizedDescription)")
         } else {
+            NSLog("[PodBLE] didDisconnect — peripheral='%@' (clean disconnect)", peripheral.name ?? "unnamed")
             delegate?.didUpdateStatus("Disconnected")
         }
         cleanupConnection()
@@ -539,9 +608,13 @@ extension PodBLECore: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error = error {
+            NSLog("[PodBLE] didDiscoverServices — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
             delegate?.didUpdateStatus("Service Discovery Error")
             return
         }
+        let serviceCount = peripheral.services?.count ?? 0
+        let matched = peripheral.services?.contains { $0.uuid == serviceUUID } ?? false
+        NSLog("[PodBLE] didDiscoverServices — found %d services, podService=%@", serviceCount, matched ? "YES" : "NO")
         guard let services = peripheral.services else { return }
         for service in services {
             if service.uuid == serviceUUID {
@@ -552,18 +625,34 @@ extension PodBLECore: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error = error {
+            NSLog("[PodBLE] didDiscoverCharacteristics — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
             delegate?.didUpdateStatus("Characteristic Discovery Error")
             return
         }
-        guard let characteristics = service.characteristics else { return }
+        guard let characteristics = service.characteristics else {
+            NSLog("[PodBLE] didDiscoverCharacteristics — no characteristics found")
+            return
+        }
 
+        var foundNotify = false
+        var foundWrite = false
         for char in characteristics {
             if char.uuid == notifyCharUUID {
                 notifyCharacteristic = char
                 peripheral.setNotifyValue(true, for: char)
+                foundNotify = true
             } else if char.uuid == writeCharUUID {
                 writeCharacteristic = char
+                foundWrite = true
             }
+        }
+
+        NSLog("[PodBLE] didDiscoverCharacteristics — total=%d, notify=%@, write=%@",
+              characteristics.count, foundNotify ? "YES" : "NO", foundWrite ? "YES" : "NO")
+
+        if !foundNotify || !foundWrite {
+            NSLog("[PodBLE] WARNING — missing characteristics! Available UUIDs: %@",
+                  characteristics.map { $0.uuid.uuidString }.joined(separator: ", "))
         }
 
         // Clear any leftover buffers on the Pod side after characteristic setup
@@ -575,6 +664,7 @@ extension PodBLECore: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             // Notification read failed — device may have disconnected
+            NSLog("[PodBLE] didUpdateValue — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
             return
         }
         guard characteristic.uuid == notifyCharUUID,
@@ -582,22 +672,12 @@ extension PodBLECore: CBPeripheralDelegate {
 
         lastPacketTime = Date()
 
-        // If we're in a download (expecting packets), route through reassembly
-        if totalExpectedPackets > 0 || receivedPacketCount == 0 {
-            // Check if this looks like the start of a new message or a continuation
-            if receivedPacketCount == 0 && data.count >= 5 {
-                // Could be a new message - check for header
-                processPacket(data)
-            } else if receivedPacketCount > 0 {
-                processPacket(data)
-            } else {
-                // Direct payload (live telemetry, file list, etc.)
-                DispatchQueue.main.async { [weak self] in
-                    self?.delegate?.didReceivePayload(data)
-                }
-            }
+        // Route packets: download reassembly vs direct passthrough
+        if isDownloadActive || totalExpectedPackets > 0 || receivedPacketCount > 0 {
+            // Active download — route through packet reassembly
+            processPacket(data)
         } else {
-            // Not in a download — pass through directly
+            // Not downloading — pass through directly (live telemetry, file list, settings, etc.)
             DispatchQueue.main.async { [weak self] in
                 self?.delegate?.didReceivePayload(data)
             }

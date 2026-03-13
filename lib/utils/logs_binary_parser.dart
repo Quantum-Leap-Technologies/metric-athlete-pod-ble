@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'package:metric_athlete_pod_ble/models/sensor_log_model.dart';
+import 'package:metric_athlete_pod_ble/utils/pod_logger.dart';
 
 /// Class used to parse downloaded .bin file [rawBytes] into [SensorLog] objects.
 /// The [rawBytes] are expected to be in Little Endian format.
@@ -49,7 +50,13 @@ class BinaryParser {
   /// | **61** | **Padding** | **-** | **3** (only in 64-byte mode) |
   static List<SensorLog> parseBytes(Uint8List rawBytes) {
     final detectedSize = _detectPacketSize(rawBytes);
-    return _parse(rawBytes, detectedSize);
+    PodLogger.info('parser', 'Detected packet size', detail: '${detectedSize}B, totalPayload=${rawBytes.length}B, estRecords=${rawBytes.length ~/ detectedSize}');
+    final logs = _parse(rawBytes, detectedSize);
+    if (logs.isNotEmpty) {
+      PodLogger.info('parser', 'Parse result',
+          detail: '${logs.length} records, first=${logs.first.timestamp.toIso8601String()}, last=${logs.last.timestamp.toIso8601String()}');
+    }
+    return logs;
   }
 
   /// Detect packet size by finding the first two valid headers and
@@ -103,11 +110,14 @@ class BinaryParser {
     final List<SensorLog> logs = [];
     final ByteData data = ByteData.sublistView(rawBytes);
     int offset = 0;
+    int syncSkips = 0;
+    int parseErrors = 0;
 
     while (offset + dataSize <= rawBytes.length) {
       // --- 1. SYNC CHECK ---
       if (!_isValidHeader(data, offset)) {
         offset++;
+        syncSkips++;
         continue;
       }
 
@@ -160,8 +170,14 @@ class BinaryParser {
         offset += stepSize;
       } catch (e) {
         offset++;
+        parseErrors++;
       }
     }
+
+    if (syncSkips > 0 || parseErrors > 0) {
+      PodLogger.warn('parser', 'Parse anomalies', detail: 'syncSkips=$syncSkips, parseErrors=$parseErrors, goodRecords=${logs.length}');
+    }
+
     return logs;
   }
 }

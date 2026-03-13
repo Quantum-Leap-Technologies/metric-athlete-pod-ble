@@ -84,18 +84,26 @@ class PodProtocolHandler {
   ///The payload is in the format described by the [BinaryParser].
   ///Filtering is NOT done here — it is handled by the notifier to avoid double-filtering.
   void _handleFileDownload(Uint8List rawBytes) {
+    PodLogger.info('sync', 'File download payload received', detail: '${rawBytes.length} bytes');
     try {
       // Parse binary data into raw SensorLog objects
       final rawLogs = BinaryParser.parseBytes(rawBytes);
+
+      PodLogger.info('sync', 'Binary parse complete', detail: '${rawLogs.length} records from ${rawBytes.length} bytes');
+
+      if (rawLogs.isEmpty && rawBytes.length > 1) {
+        PodLogger.warn('sync', 'Parse yielded 0 records from non-empty payload',
+            detail: 'first bytes: [${rawBytes.take(16).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+      }
 
       // Return raw List<SensorLog> to Notifier (filtering happens there)
       onMessageDecoded(PodMessage(
         0x03,
         "Download Complete",
-        payload: rawLogs
+        payload: rawLogs,
       ));
     } catch (e) {
-      PodLogger.error('protocol', 'Binary parse error', detail: '$e');
+      PodLogger.error('protocol', 'Binary parse error', detail: '$e, payloadSize=${rawBytes.length}');
       // Send empty list to signal failure
       onMessageDecoded(PodMessage(0x03, "Parse Failed", payload: <SensorLog>[]));
     }
@@ -157,16 +165,24 @@ class PodProtocolHandler {
   /// 4. Updates the notifier with a list of formatted file summaries.
   void _handleLogFilesInfo(Uint8List data) {
     try {
-      if (data.isEmpty) return;
-      
-      int fileCount = data[0]; 
+      if (data.isEmpty) {
+        PodLogger.warn('protocol', 'File list response empty', detail: '0 bytes received');
+        return;
+      }
+
+      int fileCount = data[0];
+      PodLogger.info('protocol', 'File list received', detail: 'fileCount=$fileCount, payloadSize=${data.length} bytes');
+
       List<String> fileSummaries = [];
-      int headerSize = 1; 
-      int stride = 36; 
-      
+      int headerSize = 1;
+      int stride = 36;
+
       for (int i = 0; i < fileCount; i++) {
         int startOffset = headerSize + (i * stride);
-        if (startOffset + stride > data.length) break;
+        if (startOffset + stride > data.length) {
+          PodLogger.warn('protocol', 'File list truncated', detail: 'file $i: need offset ${startOffset + stride} but only ${data.length} bytes');
+          break;
+        }
 
         List<int> rawName = data.sublist(startOffset, startOffset + 32);
         int nullIndex = rawName.indexOf(0x00);
@@ -176,9 +192,15 @@ class PodProtocolHandler {
         int sizeOffset = startOffset + 32;
         int size = ByteData.sublistView(data, sizeOffset, sizeOffset + 4).getUint32(0, Endian.little);
 
-        fileSummaries.add("$name (${(size / 1024).toStringAsFixed(1)} KB)");
+        final summary = "$name (${(size / 1024).toStringAsFixed(1)} KB)";
+        PodLogger.debug('protocol', 'File[$i]', detail: '$summary (${size} bytes raw)');
+        fileSummaries.add(summary);
       }
-      
+
+      if (fileCount == 0) {
+        PodLogger.warn('protocol', 'Pod reports 0 files', detail: 'payload byte[0]=$fileCount');
+      }
+
       onMessageDecoded(PodMessage(0x02, "Found $fileCount Files", payload: fileSummaries));
     } catch (e) {
       PodLogger.error('protocol', 'Error decoding file list', detail: '$e');

@@ -122,11 +122,13 @@ class PodNotifier extends Notifier<PodState> {
         break;
 
       // File list info
-      case 0x02: 
+      case 0x02:
         if (msg.payload is List<String>) {
+          final files = msg.payload as List<String>;
+          PodLogger.info('sync', 'File list updated', detail: '${files.length} files: ${files.join(", ")}');
           state = state.copyWith(
-            podFiles: msg.payload as List<String>, 
-            statusMessage: "File List Updated"
+            podFiles: files,
+            statusMessage: "File List Updated",
           );
         }
         break;
@@ -168,10 +170,11 @@ class PodNotifier extends Notifier<PodState> {
              }
 
            } else {
+             PodLogger.warn('sync', 'Downloaded file is empty/corrupt', detail: 'rawLogs.isEmpty after parse');
              state = state.copyWith(statusMessage: "Data Corrupt or Empty");
              // Signal failure to the download function
              if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-               _syncCompleter!.complete([]); 
+               _syncCompleter!.complete([]);
              }
            }
         }
@@ -209,6 +212,16 @@ class PodNotifier extends Notifier<PodState> {
   /// Sets up listeners for the native platform streams.
   void _setupNativeListeners() {
     _statusSub = _native.statusStream.listen((status) {
+      // Log all native status messages for diagnostics
+      if (status.startsWith('Downloading')) {
+        // Don't spam logs with progress updates — only log milestones
+        if (status == 'Downloading 1%' || status == 'Downloading 50%' || status == 'Downloading 100%') {
+          PodLogger.debug('ble', 'Native status', detail: status);
+        }
+      } else {
+        PodLogger.info('ble', 'Native status', detail: status);
+      }
+
       // Bluetooth unavailability — cancel scanning and surface to UI
       if (status == 'Bluetooth Off' ||
           status == 'Bluetooth Unauthorized' ||
@@ -226,16 +239,25 @@ class PodNotifier extends Notifier<PodState> {
       if (status == 'Service Discovery Error' ||
           status == 'Characteristic Discovery Error' ||
           status == 'Connection Lost') {
+        PodLogger.error('ble', 'Connection error from native', detail: status);
         _resetConnectionState();
         state = state.copyWith(statusMessage: status);
         return;
       }
       state = state.copyWith(statusMessage: status);
       if (status == "Disconnected") _resetConnectionState();
+      if (status.startsWith("Disconnected:")) {
+        PodLogger.warn('ble', 'Unexpected disconnect', detail: status);
+        _resetConnectionState();
+      }
     });
 
     _payloadSub = _native.payloadStream.listen((payload) {
-      if (payload.isEmpty) return;
+      if (payload.isEmpty) {
+        PodLogger.warn('ble', 'Empty payload received');
+        return;
+      }
+      PodLogger.debug('protocol', 'Payload received', detail: 'type=0x${payload[0].toRadixString(16).padLeft(2, '0')}, size=${payload.length} bytes');
       _protocolHandler.handleMessage(payload[0], payload.sublist(1));
     });
   }
@@ -248,6 +270,7 @@ class PodNotifier extends Notifier<PodState> {
 
     // Fail-safe: Kill any pending download futures so the UI doesn't hang forever
     if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
+       PodLogger.error('sync', 'Disconnected during active sync — aborting download future');
        _syncCompleter!.completeError("Disconnected during sync");
     }
     
@@ -607,9 +630,12 @@ class PodNotifier extends Notifier<PodState> {
     int startMillis = start?.millisecondsSinceEpoch ?? 0;
     int endMillis = end?.millisecondsSinceEpoch ?? 0;
 
+    PodLogger.info('sync', 'downloadLogFile', detail: 'file="$fileInfo", filter=[${startMillis > 0 ? DateTime.fromMillisecondsSinceEpoch(startMillis).toIso8601String() : "none"}..${endMillis > 0 ? DateTime.fromMillisecondsSinceEpoch(endMillis).toIso8601String() : "none"}], idx=$currentIndex/$totalFiles');
+
     for (int attempt = 0; attempt <= maxRetries; attempt++) {
       // Cancel any in-flight native download before retrying
       if (attempt > 0) {
+        PodLogger.info('sync', 'Retry attempt', detail: '$attempt/$maxRetries for "$fileInfo"');
         await _native.cancelDownload();
         await Future.delayed(const Duration(milliseconds: 500));
       }
@@ -621,7 +647,10 @@ class PodNotifier extends Notifier<PodState> {
 
       try {
         await _native.downloadFile(fileInfo, startMillis, endMillis, totalFiles, currentIndex);
+        final stopwatch = Stopwatch()..start();
         final result = await _syncCompleter!.future.timeout(const Duration(minutes: 45));
+        stopwatch.stop();
+        PodLogger.info('sync', 'Download complete', detail: '"$fileInfo" → ${result.length} records in ${stopwatch.elapsed.inSeconds}s');
         return result;
       } catch (e) {
         PodLogger.warn('sync', 'Download attempt failed', detail: 'attempt=${attempt + 1}: $e');
@@ -668,7 +697,8 @@ class PodNotifier extends Notifier<PodState> {
   }
 
   Future<void> getLogFilesInfo() async {
-    await _write([0x05, 0x00]); 
+    PodLogger.info('sync', 'Requesting file list from pod');
+    await _write([0x05, 0x00]);
   }
 
   Future<void> deleteLogFile(String fileInfo) async {

@@ -110,6 +110,9 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private var lastPercent = -1
     private var lastUiUpdateTime = 0L 
 
+    // --- DOWNLOAD STATE ---
+    @Volatile private var isDownloadActive = false
+
     // --- SMART PEEK FILTERING ---
     private var filterStart: Long = 0
     private var filterEnd: Long = 0
@@ -256,11 +259,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             while (isProcessing.get()) {
                 try {
                     // Blocking wait for new data
-                    val packet = packetQueue.take() 
+                    val packet = packetQueue.take()
                     if (actualPacketSize == 0) actualPacketSize = packet.size
 
-                    // 1. Reassemble
-                    processPacket(packet)
+                    // 1. Route: only reassemble during active downloads,
+                    //    otherwise pass raw packet directly to Flutter
+                    if (isDownloadActive || totalExpectedPackets > 0 || receivedPacketCount > 0) {
+                        processPacket(packet)
+                    } else {
+                        Log.d(TAG, "[ROUTE] Non-download packet (${packet.size}B, type=0x${if (packet.isNotEmpty()) String.format("%02X", packet[0]) else "??"}) → Flutter")
+                        mainHandler.post { payloadSink?.success(packet) }
+                        continue
+                    }
 
                     // 2. Smart Peek Logic
                     // Once we have enough bytes (128), check timestamp to see if we should abort.
@@ -324,6 +334,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
             // Read Total Packets
             totalExpectedPackets = ByteBuffer.wrap(packet, 5, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            Log.d(TAG, "[PACKET] Header: type=0x${String.format("%02X", type)}, totalExpected=$totalExpectedPackets, packetSize=${packet.size}")
 
             // Guard against corrupted headers: cap at 500,000 packets (~32MB at 64B/packet)
             val MAX_EXPECTED_PACKETS = 500_000
@@ -472,6 +483,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private fun startDownloadWithGatekeeper(filename: String, start: Long, end: Long) {
         stopWatchdog()
         // Reset State
+        isDownloadActive = true
         packetQueue.clear()
         receivedPacketCount = 0
         totalExpectedPackets = 0
@@ -496,8 +508,9 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         command[1] = 0x20
         for (i in nameBytes.indices) if (i < 32) command[i+2] = nameBytes[i]
         
+        Log.d(TAG, "[DOWNLOAD] Starting download: file='$cleanName', filter=${if (isFiltering) "${filterStart}-${filterEnd}" else "none"}, file $currentFileIndex/$totalFilesInPack")
         writeData(command)
-        
+
         // Arm Watchdog
         lastPacketTime = System.currentTimeMillis()
         watchdogHandler.postDelayed(watchdogTicker, 2000)
@@ -508,11 +521,13 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             updateNotification("Pod Connected", "Sync Complete. Processing...", false)
         }
         stopWatchdog()
-        
+        isDownloadActive = false
+
         // FLUSH DATA TO FLUTTER HERE
         val finalBytes = payloadBuffer.toByteArray()
+        Log.d(TAG, "[FINISH] Download complete: type=0x${String.format("%02X", currentMessageType)}, ${finalBytes.size}B, $receivedPacketCount packets")
         mainHandler.post { payloadSink?.success(finalBytes) }
-        
+
         // Cleanup for next file
         receivedPacketCount = 0
         totalExpectedPackets = 0
@@ -522,6 +537,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private fun abortDownload(reason: String = "User Cancelled") {
         updateNotification("Syncing Data", "Skipping file...", true, calculateOverallPercent(100))
         stopWatchdog()
+        isDownloadActive = false
         writeData(byteArrayOf(0x08)) // Send Cancel Command (0x08)
         
         packetQueue.clear()

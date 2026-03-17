@@ -40,6 +40,19 @@ class PodState {
   ///This holds the raw lists of data of a downloaded session.
   final List<List<SensorLog>> rawClusters;
 
+  // --- Storage ---
+  /// Total bytes used by log files on the pod's NAND storage.
+  /// Updated when LogFilesInfo is received.
+  final int storageUsedBytes;
+
+  /// Pod NAND storage capacity in bytes. Default 32 MB.
+  /// Override via copyWith if a different pod hardware revision is used.
+  final int storageCapacityBytes;
+
+  /// Storage usage as a percentage (0.0 to 100.0).
+  double get storagePercentUsed =>
+      storageCapacityBytes > 0 ? (storageUsedBytes / storageCapacityBytes * 100).clamp(0.0, 100.0) : 0.0;
+
   // --- Signal Quality ---
   /// Last known RSSI (Received Signal Strength Indicator) in dBm.
   /// Null if no RSSI has been received yet.
@@ -65,6 +78,8 @@ class PodState {
     this.settingsPlayerNumber = 0,
     this.settingsLogInterval = 100, // Default 10Hz
     this.rawClusters = const [], // Default empty
+    this.storageUsedBytes = 0,
+    this.storageCapacityBytes = 32 * 1024 * 1024, // 32 MB default
     this.lastRssi,
     this.clockDriftMs,
   });
@@ -85,6 +100,8 @@ class PodState {
     int? settingsPlayerNumber,
     int? settingsLogInterval,
     List<List<SensorLog>>? rawClusters,
+    int? storageUsedBytes,
+    int? storageCapacityBytes,
     int? lastRssi,
     int? clockDriftMs,
   }) {
@@ -102,6 +119,8 @@ class PodState {
       settingsPlayerNumber: settingsPlayerNumber ?? this.settingsPlayerNumber,
       settingsLogInterval: settingsLogInterval ?? this.settingsLogInterval,
       rawClusters: rawClusters ?? this.rawClusters,
+      storageUsedBytes: storageUsedBytes ?? this.storageUsedBytes,
+      storageCapacityBytes: storageCapacityBytes ?? this.storageCapacityBytes,
       lastRssi: lastRssi ?? this.lastRssi,
       clockDriftMs: clockDriftMs ?? this.clockDriftMs,
     );

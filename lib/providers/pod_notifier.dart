@@ -123,11 +123,14 @@ class PodNotifier extends Notifier<PodState> {
 
       // File list info
       case 0x02:
-        if (msg.payload is List<String>) {
-          final files = msg.payload as List<String>;
-          PodLogger.info('sync', 'File list updated', detail: '${files.length} files: ${files.join(", ")}');
+        if (msg.payload is Map) {
+          final payload = msg.payload as Map;
+          final files = (payload['files'] as List<String>?) ?? [];
+          final usedBytes = (payload['storageUsedBytes'] as int?) ?? 0;
+          PodLogger.info('sync', 'File list updated', detail: '${files.length} files, storage=${(usedBytes / (1024 * 1024)).toStringAsFixed(1)} MB (${state.storageCapacityBytes > 0 ? (usedBytes / state.storageCapacityBytes * 100).toStringAsFixed(0) : "?"}%)');
           state = state.copyWith(
             podFiles: files,
+            storageUsedBytes: usedBytes,
             statusMessage: "File List Updated",
           );
         }

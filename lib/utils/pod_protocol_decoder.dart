@@ -196,6 +196,7 @@ class PodProtocolHandler {
       PodLogger.info('protocol', 'File list received', detail: 'fileCount=$fileCount, payloadSize=${data.length} bytes');
 
       List<String> fileSummaries = [];
+      int totalUsedBytes = 0;
       int headerSize = 1;
       int stride = 36;
 
@@ -213,17 +214,23 @@ class PodProtocolHandler {
 
         int sizeOffset = startOffset + 32;
         int size = ByteData.sublistView(data, sizeOffset, sizeOffset + 4).getUint32(0, Endian.little);
+        totalUsedBytes += size;
 
         final summary = "$name (${(size / 1024).toStringAsFixed(1)} KB)";
         PodLogger.debug('protocol', 'File[$i]', detail: '$summary (${size} bytes raw)');
         fileSummaries.add(summary);
       }
 
+      PodLogger.info('protocol', 'Storage used', detail: '${(totalUsedBytes / (1024 * 1024)).toStringAsFixed(1)} MB across $fileCount files');
+
       if (fileCount == 0) {
         PodLogger.warn('protocol', 'Pod reports 0 files', detail: 'payload byte[0]=$fileCount');
       }
 
-      onMessageDecoded(PodMessage(0x02, "Found $fileCount Files", payload: fileSummaries));
+      onMessageDecoded(PodMessage(0x02, "Found $fileCount Files", payload: {
+        'files': fileSummaries,
+        'storageUsedBytes': totalUsedBytes,
+      }));
     } catch (e) {
       PodLogger.error('protocol', 'Error decoding file list', detail: '$e');
     }

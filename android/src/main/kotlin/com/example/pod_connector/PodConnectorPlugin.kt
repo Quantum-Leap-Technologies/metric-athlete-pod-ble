@@ -382,10 +382,19 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     /**
-     * Detect firmware record size from peek data (61 or 64 bytes).
-     * Checks if a valid record header exists at offset 61 (Proewe firmware).
+     * Detect firmware record size from peek data (47, 61 or 64 bytes).
+     * Checks if a valid record header exists at the start of the second record.
+     * Returns 47 for V3.6 (v01), 61 for Proewe, 64 for HTS firmware.
      */
     private fun detectRecordSize(peekData: ByteArray): Int {
+        // Check for V3.6 v01 format (47-byte records)
+        if (peekData.size >= 55) {
+            val year = ByteBuffer.wrap(peekData, 51, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+            val month = peekData[53].toInt() and 0xFF
+            val day = peekData[54].toInt() and 0xFF
+            if (year in 2022..2030 && month in 1..12 && day in 1..31) return 47
+        }
+        // Check for Proewe format (61-byte records)
         if (peekData.size >= 69) {
             val year = ByteBuffer.wrap(peekData, 65, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
             val month = peekData[67].toInt() and 0xFF
@@ -452,8 +461,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         // Auto-connect set to 'false' for faster initial connection
         synchronized(gattLock) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // Allow both 1M and 2M PHY at connect time; 2M upgrade requested in onConnectionStateChange
                 bluetoothGatt = device?.connectGatt(
-                    context, false, gattCallback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, bluetoothHandler
+                    context, false, gattCallback, BluetoothDevice.TRANSPORT_LE,
+                    BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK, bluetoothHandler
                 )
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 bluetoothGatt = device?.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -555,12 +566,45 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 sendStatus("Connected")
-                // Optimization: Request priority immediately
-                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+                // Optimization: Request HIGH priority for fastest connection interval (~7.5ms)
+                // This also triggers Data Length Extension (DLE) negotiation on Android 8+
+                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 mainHandler.postDelayed({ gatt.requestMtu(512) }, 300)
+                // Request 2M PHY for double throughput (BLE 5.0)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    mainHandler.postDelayed({
+                        gatt.setPreferredPhy(
+                            BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_NO_PREFERRED
+                        )
+                    }, 400)
+                }
                 mainHandler.postDelayed({ gatt.discoverServices() }, 600)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 disconnectDevice()
+            }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "[BLE] MTU negotiated: ${mtu} bytes (payload=${mtu - 3} bytes). DLE should be active if MTU > 27.")
+            } else {
+                Log.w(TAG, "[BLE] MTU negotiation failed with status $status, using default MTU")
+            }
+        }
+
+        override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+            val phyName = { phy: Int -> when (phy) {
+                BluetoothDevice.PHY_LE_1M -> "1M"
+                BluetoothDevice.PHY_LE_2M -> "2M"
+                BluetoothDevice.PHY_LE_CODED -> "Coded"
+                else -> "Unknown($phy)"
+            }}
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "[BLE] PHY updated: TX=${phyName(txPhy)}, RX=${phyName(rxPhy)}")
+            } else {
+                Log.w(TAG, "[BLE] PHY update failed (status=$status), staying on current PHY")
             }
         }
 
@@ -577,7 +621,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             if (rawPacket != null && rawPacket.isNotEmpty()) {
                 lastPacketTime = System.currentTimeMillis()
                 // Fast handoff to processing thread
-                packetQueue.offer(rawPacket) 
+                packetQueue.offer(rawPacket)
             }
         }
     }

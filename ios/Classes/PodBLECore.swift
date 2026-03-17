@@ -19,9 +19,9 @@ class PodBLECore: NSObject {
     private let writeCharUUID = CBUUID(string: "FB4A9352-9BCD-4CC6-80E4-AE37D16FFBF1")  // Phone → Pod
 
     private let scanDurationSeconds: TimeInterval = 15
-    private let watchdogTimeoutSeconds: TimeInterval = 300
-    private let stuckThresholdSeconds: TimeInterval = 10.0
-    private let stuckProgressThreshold: Double = 0.99
+    private let watchdogTimeoutSeconds: TimeInterval = 60
+    private let stuckThresholdSeconds: TimeInterval = 5.0
+    private let stuckProgressThreshold: Double = 0.98
 
     // MARK: - Properties
 
@@ -348,21 +348,31 @@ class PodBLECore: NSObject {
 
     // MARK: - Smart Peek
 
-    /// Detect firmware record size from peek data (61 or 64 bytes).
-    /// Checks if a valid record header exists at offset 61 (Proewe firmware).
+    /// Detect firmware record size from peek data (47, 61, or 64 bytes).
+    /// Checks if a valid record header exists at the start of the second record.
+    /// Returns 47 for V3.6 (v01), 61 for Proewe, 64 for HTS firmware.
     private func detectRecordSize(from data: Data) -> Int {
-        guard data.count >= 69 else {
-            NSLog("[PodBLE] detectRecordSize — data too short (%d bytes), defaulting to 64", data.count)
-            return 64
+        // Check for V3.6 v01 format (47-byte records)
+        if data.count >= 55 {
+            let year = Int(data.subdata(in: 51..<53).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian })
+            let month = Int(data[53])
+            let day = Int(data[54])
+            if year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+                NSLog("[PodBLE] detectRecordSize — V3.6 firmware (47-byte v01 records), probe date=%d-%02d-%02d", year, month, day)
+                return 47
+            }
         }
-        let year = Int(data.subdata(in: 65..<67).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian })
-        let month = Int(data[67])
-        let day = Int(data[68])
-        if year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
-            NSLog("[PodBLE] detectRecordSize — Proewe firmware (61-byte records), probe date=%d-%02d-%02d", year, month, day)
-            return 61
+        // Check for Proewe format (61-byte records)
+        if data.count >= 69 {
+            let year = Int(data.subdata(in: 65..<67).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian })
+            let month = Int(data[67])
+            let day = Int(data[68])
+            if year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+                NSLog("[PodBLE] detectRecordSize — Proewe firmware (61-byte records), probe date=%d-%02d-%02d", year, month, day)
+                return 61
+            }
         }
-        NSLog("[PodBLE] detectRecordSize — HTS firmware (64-byte records), probe values: year=%d month=%d day=%d", year, month, day)
+        NSLog("[PodBLE] detectRecordSize — HTS firmware (64-byte records, default)")
         return 64
     }
 

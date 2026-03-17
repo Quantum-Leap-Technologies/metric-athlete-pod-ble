@@ -23,7 +23,7 @@ class UsbFilePredictor {
     final int size = await file.length();
 
     // Safety Check: File must be at least 2 records to be valid.
-    if (size < 122) return null; // 61 * 2 = 122 (minimum for smallest record size)
+    if (size < 94) return null; // 47 * 2 = 94 (minimum for smallest record size, v01)
 
     try {
       final raf = await file.open();
@@ -54,18 +54,31 @@ class UsbFilePredictor {
     return null;
   }
 
-  /// Detect record size by checking if byte 61 starts a valid header.
-  /// Returns 61 for Proewe firmware, 64 for original HTS firmware.
+  /// Detect record size by checking if a valid header starts at byte 47, 61, or 64.
+  /// Returns 47 for V3.6 firmware (v01), 61 for Proewe, 64 for original HTS.
   static int _detectRecordSize(Uint8List data) {
+    final bd = ByteData.sublistView(data);
+
+    // Check for V3.6 v01 format (47-byte records)
+    if (data.length >= 55) {
+      final year = bd.getUint16(51, Endian.little); // 47 + 4
+      final month = data[53]; // 47 + 6
+      final day = data[54]; // 47 + 7
+      if (year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        return 47;
+      }
+    }
+
+    // Check for Proewe format (61-byte records)
     if (data.length >= 69) {
-      final bd = ByteData.sublistView(data);
-      final year = bd.getUint16(65, Endian.little);
-      final month = data[67];
-      final day = data[68];
+      final year = bd.getUint16(65, Endian.little); // 61 + 4
+      final month = data[67]; // 61 + 6
+      final day = data[68]; // 61 + 7
       if (year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
         return 61;
       }
     }
+
     return 64;
   }
 

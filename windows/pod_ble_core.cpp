@@ -433,13 +433,23 @@ void PodBLECore::ProcessPacket(const std::vector<uint8_t>& packet) {
     }
 }
 
-// Detect firmware record size from payload buffer (61 or 64 bytes).
-// Checks if a valid record header exists at offset 1+61=62 (Proewe firmware).
+// Detect firmware record size from payload buffer (47, 61, or 64 bytes).
 // Buffer includes the 1-byte type prefix, so the second record header starts at 1+recordSize.
+// Returns 47 for V3.6 (v01), 61 for Proewe, 64 for HTS firmware.
 int PodBLECore::DetectRecordSize(const std::vector<uint8_t>& buffer) {
-    // Need at least 1 (type) + 61 (first record) + 8 (header of second record) = 70 bytes
+    // Check for V3.6 v01 format (47-byte records)
+    // Need at least 1 (type) + 47 (first record) + 8 (header of second) = 56 bytes
+    if (buffer.size() >= 56) {
+        uint16_t year = buffer[52] | (buffer[53] << 8);
+        uint8_t month = buffer[54];
+        uint8_t day = buffer[55];
+        if (year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+            return 47;
+        }
+    }
+    // Check for Proewe format (61-byte records)
+    // Need at least 1 (type) + 61 (first record) + 8 (header of second) = 70 bytes
     if (buffer.size() >= 70) {
-        // Second record at offset 62; year is 4 bytes into the record header
         uint16_t year = buffer[66] | (buffer[67] << 8);
         uint8_t month = buffer[68];
         uint8_t day = buffer[69];

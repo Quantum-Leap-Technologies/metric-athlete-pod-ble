@@ -96,6 +96,28 @@ class PodProtocolHandler {
             detail: 'first bytes: [${rawBytes.take(16).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
       }
 
+      // --- INTEGRITY CHECK ---
+      // Verify the parsed record count is consistent with the payload size.
+      // If records were silently lost during BLE reassembly, this catches it.
+      if (rawLogs.isNotEmpty) {
+        final knownSizes = [
+          BinaryParser.v01DataSize, // 47 (V3.6)
+          BinaryParser.dataSize,    // 61 (Proewe)
+          BinaryParser.packetSize,  // 64 (HTS)
+        ];
+        for (final recordSize in knownSizes) {
+          if (rawBytes.length % recordSize == 0) {
+            final expectedRecords = rawBytes.length ~/ recordSize;
+            final lossPercent = ((expectedRecords - rawLogs.length) / expectedRecords * 100);
+            if (lossPercent > 5.0) {
+              PodLogger.warn('sync', 'Possible data loss during transfer',
+                  detail: 'expected ~$expectedRecords records (${recordSize}B each), got ${rawLogs.length} (${lossPercent.toStringAsFixed(1)}% loss)');
+            }
+            break;
+          }
+        }
+      }
+
       // Return raw List<SensorLog> to Notifier (filtering happens there)
       onMessageDecoded(PodMessage(
         0x03,

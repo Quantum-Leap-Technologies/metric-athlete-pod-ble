@@ -152,9 +152,22 @@ class PacketReassembler {
     return null;
   }
 
-  /// Detect firmware record size from payload buffer (61 or 64 bytes).
-  /// Returns 61 for Proewe firmware, 64 for HTS firmware.
+  /// Detect firmware record size from payload buffer (47, 61 or 64 bytes).
+  /// Returns 47 for V3.6 (v01), 61 for Proewe, 64 for HTS firmware.
   static int detectRecordSize(Uint8List buffer) {
+    // Check for V3.6 v01 format (47-byte records)
+    // Need at least 1 (type) + 47 (first record) + 8 (header of second) = 56 bytes
+    if (buffer.length >= 56) {
+      // Second record at offset 48; year is 4 bytes into the record header
+      final year = buffer[52] | (buffer[53] << 8);
+      final month = buffer[54];
+      final day = buffer[55];
+      if (year >= 2022 && year <= 2030 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        return 47;
+      }
+    }
+
+    // Check for Proewe format (61-byte records)
     // Need at least 1 (type) + 61 (first record) + 8 (header of second) = 70 bytes
     if (buffer.length >= 70) {
       // Second record at offset 62; year is 4 bytes into the record header
@@ -165,6 +178,7 @@ class PacketReassembler {
         return 61;
       }
     }
+
     return 64;
   }
 }

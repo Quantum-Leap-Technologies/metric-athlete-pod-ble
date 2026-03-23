@@ -32,6 +32,10 @@ class FilterConfig {
   /// If exceeded, speed-inferred distance is used instead.
   final double maxGpsJumpMeters;
 
+  /// Optional Kalman+RTS trajectory filter configuration.
+  /// When null, [TrajectoryConfig] defaults are used.
+  final TrajectoryConfig? trajectoryConfig;
+
   const FilterConfig({
     this.enableSanityCheck = true,
     this.enableGapRepair = true,
@@ -41,6 +45,7 @@ class FilterConfig {
     this.butterworthCutoffHz = 5.0,
     this.butterworthSamplingHz = 10.0,
     this.maxGpsJumpMeters = 1.0,
+    this.trajectoryConfig,
   });
 }
 
@@ -81,7 +86,9 @@ class FilterPipeline {
 
   /// Process with explicit configuration.
   static FilterPipelineResult processWithConfig(
-      List<SensorLog> logs, FilterConfig config) {
+    List<SensorLog> logs,
+    FilterConfig config,
+  ) {
     if (logs.isEmpty) {
       return FilterPipelineResult(
         logs: [],
@@ -94,7 +101,10 @@ class FilterPipeline {
 
     // Run the existing TrajectoryFilter (Stages -1, 0, 1-2)
     // It handles sanity check, gap repair, and Kalman+RTS internally
-    final TrajectoryResult trajectoryResult = TrajectoryFilter.process(logs);
+    final trajectoryConfig =
+        config.trajectoryConfig ?? const TrajectoryConfig();
+    final TrajectoryResult trajectoryResult =
+        TrajectoryFilter.processWithConfig(logs, trajectoryConfig);
 
     List<SensorLog> processedLogs = trajectoryResult.logs;
     int outliersCorrected = 0;
@@ -132,7 +142,9 @@ class FilterPipeline {
 
   /// Apply Butterworth low-pass filter to accelerometer and gyroscope channels.
   static List<SensorLog> _applyButterworth(
-      List<SensorLog> logs, FilterConfig config) {
+    List<SensorLog> logs,
+    FilterConfig config,
+  ) {
     final filter = ButterworthFilter(
       cutoffHz: config.butterworthCutoffHz,
       samplingHz: config.butterworthSamplingHz,
@@ -177,7 +189,9 @@ class FilterPipeline {
   /// correction cascade drift. Limits consecutive corrections to 3 before
   /// re-anchoring to the raw GPS position.
   static (List<SensorLog>, int) _applyOutlierRejection(
-      List<SensorLog> logs, FilterConfig config) {
+    List<SensorLog> logs,
+    FilterConfig config,
+  ) {
     final List<SensorLog> corrected = [logs[0]];
     int corrections = 0;
     int consecutiveCorrections = 0;
@@ -191,8 +205,10 @@ class FilterPipeline {
 
       // Compare against last accepted position to prevent cascade drift
       double distance = _haversine(
-        lastAcceptedLat, lastAcceptedLon,
-        curr.latitude, curr.longitude,
+        lastAcceptedLat,
+        lastAcceptedLon,
+        curr.latitude,
+        curr.longitude,
       );
 
       double timeDiffSec =
@@ -204,26 +220,24 @@ class FilterPipeline {
           distance > config.maxGpsJumpMeters) {
         // Use speed-inferred distance instead of GPS jump
         double avgSpeedMs =
-            ((prev.speed + curr.speed) / 2.0) / 3.6; // km/h → m/s
+            ((prev.speed + curr.speed) / 2.0) / 3.6; // km/h -> m/s
         double expectedDist = avgSpeedMs * timeDiffSec;
 
         if (expectedDist < distance) {
           // Interpolate position based on expected distance from previous output
           double distFromPrev = _haversine(
-            prev.latitude, prev.longitude,
-            curr.latitude, curr.longitude,
+            prev.latitude,
+            prev.longitude,
+            curr.latitude,
+            curr.longitude,
           );
-          double ratio =
-              distFromPrev > 0 ? expectedDist / distFromPrev : 0;
-          double newLat = prev.latitude +
-              (curr.latitude - prev.latitude) * ratio;
-          double newLon = prev.longitude +
-              (curr.longitude - prev.longitude) * ratio;
+          double ratio = distFromPrev > 0 ? expectedDist / distFromPrev : 0;
+          double newLat =
+              prev.latitude + (curr.latitude - prev.latitude) * ratio;
+          double newLon =
+              prev.longitude + (curr.longitude - prev.longitude) * ratio;
 
-          corrected.add(curr.copyWith(
-            latitude: newLat,
-            longitude: newLon,
-          ));
+          corrected.add(curr.copyWith(latitude: newLat, longitude: newLon));
           corrections++;
           consecutiveCorrections++;
           continue;
@@ -240,12 +254,12 @@ class FilterPipeline {
     return (corrected, corrections);
   }
 
-  static double _haversine(
-      double lat1, double lon1, double lat2, double lon2) {
+  static double _haversine(double lat1, double lon1, double lat2, double lon2) {
     const R = 6371000.0;
     var dLat = (lat2 - lat1) * pi / 180;
     var dLon = (lon2 - lon1) * pi / 180;
-    var a = sin(dLat / 2) * sin(dLat / 2) +
+    var a =
+        sin(dLat / 2) * sin(dLat / 2) +
         cos(lat1 * pi / 180) *
             cos(lat2 * pi / 180) *
             sin(dLon / 2) *

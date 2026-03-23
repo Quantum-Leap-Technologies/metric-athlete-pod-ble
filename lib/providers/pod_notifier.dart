@@ -14,7 +14,7 @@ import 'package:metric_athlete_pod_ble/utils/ble_command_queue.dart';
 import 'package:metric_athlete_pod_ble/utils/pod_protocol_decoder.dart';
 
 /// The central State Management class for the Pod Connector application.
-/// 
+///
 /// This Notifier handles:
 /// 1. **Bluetooth Management:** Scanning, connecting, and disconnecting from Pod devices.
 /// 2. **Data Protocol:** Sending commands (Write) and processing incoming data (Read) via [PodProtocolHandler].
@@ -29,10 +29,10 @@ class PodNotifier extends Notifier<PodState> {
 
   // Timer to sync UI with Native Scanner timeout
   Timer? _scanTimer;
-  
+
   // Handles the decoding of raw bytes into usable Dart objects.
   late PodProtocolHandler _protocolHandler;
-  
+
   // Service for saving CSV files to the device's document directory.
   final _storage = StorageService();
 
@@ -43,23 +43,32 @@ class PodNotifier extends Notifier<PodState> {
 
   // Internal flags for state management.
   bool _hasAutoConnected = false;
-  bool _isCancellingDownload = false; 
-  
+  bool _isCancellingDownload = false;
+
   // Buffer to hold live telemetry data during a recording session.
   List<LiveTelemetry> _liveSessionBuffer = [];
-  
+
   // Completer used to turn the listener-based download flow into a Future-based awaitable.
   // This allows the UI to 'await' a file download even though the data comes in asynchronously via streams.
   Completer<List<SensorLog>>? _syncCompleter;
+
+  /// Raw (pre-Kalman) sensor logs from the most recent download.
+  ///
+  /// Available after [downloadLogFile] completes. Use these for haversine
+  /// distance calculation — raw GPS positions are ~10% more accurate than
+  /// Kalman-filtered positions for distance.
+  List<SensorLog>? lastRawLogs;
 
   @override
   PodState build() {
     _setupNativeListeners();
     // Initialize the Protocol Handler.
-    // We pass the `_handleDecodedMessage` function so the handler can call back 
+    // We pass the `_handleDecodedMessage` function so the handler can call back
     // to this Notifier whenever it successfully parses a packet.
-    _protocolHandler = PodProtocolHandler(onMessageDecoded: _handleDecodedMessage);
-    
+    _protocolHandler = PodProtocolHandler(
+      onMessageDecoded: _handleDecodedMessage,
+    );
+
     // LIFECYCLE CLEANUP
     // This ensures that if the provider is destroyed, we kill the timer and streams.
     ref.onDispose(() {
@@ -79,8 +88,7 @@ class PodNotifier extends Notifier<PodState> {
   /// This function receives the decoded [PodMessage] from the [PodProtocolHandler].
   /// It serves as the central "Router" that updates the app state based on what the Pod sent.
   void _handleDecodedMessage(PodMessage msg) async {
-      switch (msg.type) {
-      
+    switch (msg.type) {
       // Live stream data
       case 0x01:
         if (msg.payload is LiveTelemetry) {
@@ -94,8 +102,14 @@ class PodNotifier extends Notifier<PodState> {
             final deviceNow = DateTime.now().toUtc();
             driftMs = podTs.difference(deviceNow).inMilliseconds;
             // Only log significant drift (>5 seconds)
-            if (driftMs.abs() > 5000 && (state.clockDriftMs == null || (driftMs - (state.clockDriftMs ?? 0)).abs() > 1000)) {
-              PodLogger.warn('clock', 'Pod clock drift detected', detail: '${driftMs}ms');
+            if (driftMs.abs() > 5000 &&
+                (state.clockDriftMs == null ||
+                    (driftMs - (state.clockDriftMs ?? 0)).abs() > 1000)) {
+              PodLogger.warn(
+                'clock',
+                'Pod clock drift detected',
+                detail: '${driftMs}ms',
+              );
             }
           }
 
@@ -103,19 +117,21 @@ class PodNotifier extends Notifier<PodState> {
           // Append to end (O(1) amortized) and take last 200
           final history = List<LiveTelemetry>.from(state.telemetryHistory);
           history.add(newData);
-          final trimmed = history.length > 200
-              ? history.sublist(history.length - 200)
-              : history;
+          final trimmed =
+              history.length > 200
+                  ? history.sublist(history.length - 200)
+                  : history;
 
           //Record to buffer if the user has started a recording session
           if (state.isRecording) {
-             _appendToFile(newData);
+            _appendToFile(newData);
           }
 
           state = state.copyWith(
             latestTelemetry: newData,
             telemetryHistory: trimmed,
-            statusMessage: state.isRecording ? "Recording..." : state.statusMessage,
+            statusMessage:
+                state.isRecording ? "Recording..." : state.statusMessage,
             clockDriftMs: driftMs ?? state.clockDriftMs,
           );
         }
@@ -127,7 +143,12 @@ class PodNotifier extends Notifier<PodState> {
           final payload = msg.payload as Map;
           final files = (payload['files'] as List<String>?) ?? [];
           final usedBytes = (payload['storageUsedBytes'] as int?) ?? 0;
-          PodLogger.info('sync', 'File list updated', detail: '${files.length} files, storage=${(usedBytes / (1024 * 1024)).toStringAsFixed(1)} MB (${state.storageCapacityBytes > 0 ? (usedBytes / state.storageCapacityBytes * 100).toStringAsFixed(0) : "?"}%)');
+          PodLogger.info(
+            'sync',
+            'File list updated',
+            detail:
+                '${files.length} files, storage=${(usedBytes / (1024 * 1024)).toStringAsFixed(1)} MB (${state.storageCapacityBytes > 0 ? (usedBytes / state.storageCapacityBytes * 100).toStringAsFixed(0) : "?"}%)',
+          );
           state = state.copyWith(
             podFiles: files,
             storageUsedBytes: usedBytes,
@@ -137,77 +158,98 @@ class PodNotifier extends Notifier<PodState> {
         break;
 
       // File Download (UPDATED WITH BACKGROUND FILTER)
-      case 0x03: 
+      case 0x03:
         if (msg.payload is List<SensorLog>) {
-           final rawLogs = msg.payload as List<SensorLog>;
-           
-           if (rawLogs.isNotEmpty) {
-             state = state.copyWith(statusMessage: "Processing Trajectory...");
+          final rawLogs = msg.payload as List<SensorLog>;
 
-             try {
-               // --- 🚀 PERFORMANCE FIX: RUN FILTER IN BACKGROUND ---
-               // We use compute() to prevent the UI from freezing while calculating 
-               // the Kalman Filter and interpolating gaps.
-               final TrajectoryResult result = await compute(TrajectoryFilter.process, rawLogs);
+          if (rawLogs.isNotEmpty) {
+            // Store raw (pre-Kalman) logs for distance calculation.
+            // Raw GPS positions give ~10% more accurate haversine distance.
+            lastRawLogs = List.unmodifiable(rawLogs);
 
-               // --- HEALTH CHECK ---
-               if (result.healthScore < 60.0) {
-                 PodLogger.warn('sync', 'Poor data quality', detail: 'health=${result.healthScore.toStringAsFixed(1)}%');
-               }
+            state = state.copyWith(statusMessage: "Processing Trajectory...");
 
-               PodLogger.info('sync', 'Filter complete', detail: 'logs=${result.logs.length}, health=${result.healthScore.toInt()}%');
-               
-               state = state.copyWith(statusMessage: "Data Verified (Health: ${result.healthScore.toInt()}%)");
-               
-               // Complete the pending Future waiting in `downloadLogFile` with the SMOOTHED logs
-               if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-                 _syncCompleter!.complete(result.logs); 
-               }
+            try {
+              // --- 🚀 PERFORMANCE FIX: RUN FILTER IN BACKGROUND ---
+              // We use compute() to prevent the UI from freezing while calculating
+              // the Kalman Filter and interpolating gaps.
+              final TrajectoryResult result = await compute(
+                TrajectoryFilter.process,
+                rawLogs,
+              );
 
-             } catch (e) {
-               PodLogger.error('sync', 'Filter error', detail: '$e');
-               // Fallback: If filter crashes, return raw logs so user doesn't lose data
-               if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-                 _syncCompleter!.complete(rawLogs); 
-               }
-             }
+              // --- HEALTH CHECK ---
+              if (result.healthScore < 60.0) {
+                PodLogger.warn(
+                  'sync',
+                  'Poor data quality',
+                  detail: 'health=${result.healthScore.toStringAsFixed(1)}%',
+                );
+              }
 
-           } else {
-             PodLogger.warn('sync', 'Downloaded file is empty/corrupt', detail: 'rawLogs.isEmpty after parse');
-             state = state.copyWith(statusMessage: "Data Corrupt or Empty");
-             // Signal failure to the download function
-             if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-               _syncCompleter!.complete([]);
-             }
-           }
+              PodLogger.info(
+                'sync',
+                'Filter complete',
+                detail:
+                    'logs=${result.logs.length}, health=${result.healthScore.toInt()}%',
+              );
+
+              state = state.copyWith(
+                statusMessage:
+                    "Data Verified (Health: ${result.healthScore.toInt()}%)",
+              );
+
+              // Complete the pending Future waiting in `downloadLogFile` with the SMOOTHED logs
+              if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
+                _syncCompleter!.complete(result.logs);
+              }
+            } catch (e) {
+              PodLogger.error('sync', 'Filter error', detail: '$e');
+              // Fallback: If filter crashes, return raw logs so user doesn't lose data
+              if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
+                _syncCompleter!.complete(rawLogs);
+              }
+            }
+          } else {
+            PodLogger.warn(
+              'sync',
+              'Downloaded file is empty/corrupt',
+              detail: 'rawLogs.isEmpty after parse',
+            );
+            state = state.copyWith(statusMessage: "Data Corrupt or Empty");
+            // Signal failure to the download function
+            if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
+              _syncCompleter!.complete([]);
+            }
+          }
         }
         break;
-      
+
       // Device settings
-      case 0x05: 
+      case 0x05:
         if (msg.payload is Map<String, dynamic>) {
           final settings = msg.payload as Map<String, dynamic>;
           state = state.copyWith(
             isLoadingSettings: false,
             settingsPlayerNumber: settings['playerNumber'],
-            settingsLogInterval: settings['logInterval'], 
+            settingsLogInterval: settings['logInterval'],
             statusMessage: "Settings Loaded",
           );
         }
         break;
 
       // Skipped file during download process
-      case 0xda: 
+      case 0xda:
         state = state.copyWith(statusMessage: "Skipped: Out of Range");
         if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-           _syncCompleter!.complete([]);
+          _syncCompleter!.complete([]);
         }
         break;
-      
+
       // Default message to catch unknown messages
       default:
         if (msg.description.isNotEmpty) {
-           state = state.copyWith(statusMessage: msg.description);
+          state = state.copyWith(statusMessage: msg.description);
         }
     }
   }
@@ -218,7 +260,9 @@ class PodNotifier extends Notifier<PodState> {
       // Log all native status messages for diagnostics
       if (status.startsWith('Downloading')) {
         // Don't spam logs with progress updates — only log milestones
-        if (status == 'Downloading 1%' || status == 'Downloading 50%' || status == 'Downloading 100%') {
+        if (status == 'Downloading 1%' ||
+            status == 'Downloading 50%' ||
+            status == 'Downloading 100%') {
           PodLogger.debug('ble', 'Native status', detail: status);
         }
       } else {
@@ -232,10 +276,7 @@ class PodNotifier extends Notifier<PodState> {
           status == 'Scan Failed' ||
           status == 'Permissions Error') {
         _scanTimer?.cancel();
-        state = state.copyWith(
-          statusMessage: status,
-          isScanning: false,
-        );
+        state = state.copyWith(statusMessage: status, isScanning: false);
         return;
       }
       // Connection errors from native hardening — treat as disconnect
@@ -260,7 +301,12 @@ class PodNotifier extends Notifier<PodState> {
         PodLogger.warn('ble', 'Empty payload received');
         return;
       }
-      PodLogger.debug('protocol', 'Payload received', detail: 'type=0x${payload[0].toRadixString(16).padLeft(2, '0')}, size=${payload.length} bytes');
+      PodLogger.debug(
+        'protocol',
+        'Payload received',
+        detail:
+            'type=0x${payload[0].toRadixString(16).padLeft(2, '0')}, size=${payload.length} bytes',
+      );
       _protocolHandler.handleMessage(payload[0], payload.sublist(1));
     });
   }
@@ -273,12 +319,15 @@ class PodNotifier extends Notifier<PodState> {
 
     // Fail-safe: Kill any pending download futures so the UI doesn't hang forever
     if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-       PodLogger.error('sync', 'Disconnected during active sync — aborting download future');
-       _syncCompleter!.completeError("Disconnected during sync");
+      PodLogger.error(
+        'sync',
+        'Disconnected during active sync — aborting download future',
+      );
+      _syncCompleter!.completeError("Disconnected during sync");
     }
-    
+
     state = PodState(
-      scannedDevices: state.scannedDevices, 
+      scannedDevices: state.scannedDevices,
       isScanning: state.isScanning,
       podFiles: [],
       isRecording: false, // Ensure recording stops on disconnect
@@ -293,7 +342,9 @@ class PodNotifier extends Notifier<PodState> {
   Future<void> startScan() async {
     // 1. Reset any existing timer to prevent bugs if user spams the button
     _scanTimer?.cancel();
-    debugPrint('[BLE-Plugin] startScan() called — platform=${Platform.operatingSystem}');
+    debugPrint(
+      '[BLE-Plugin] startScan() called — platform=${Platform.operatingSystem}',
+    );
 
     // 2. Check permissions (mobile only — callers are responsible for requesting)
     if (Platform.isAndroid) {
@@ -307,7 +358,9 @@ class PodNotifier extends Notifier<PodState> {
       var permStatus = await Permission.bluetooth.status;
       debugPrint('[BLE-Plugin] iOS bluetooth status=$permStatus');
       // If not yet determined or denied, request permission
-      if (!permStatus.isGranted && !permStatus.isLimited && !permStatus.isRestricted) {
+      if (!permStatus.isGranted &&
+          !permStatus.isLimited &&
+          !permStatus.isRestricted) {
         permStatus = await Permission.bluetooth.request();
         debugPrint('[BLE-Plugin] iOS bluetooth after request=$permStatus');
       }
@@ -315,7 +368,9 @@ class PodNotifier extends Notifier<PodState> {
       // authorization and will surface "Bluetooth Unauthorized" via the
       // native status stream if truly blocked.
       if (permStatus.isPermanentlyDenied) {
-        state = state.copyWith(statusMessage: "Bluetooth permission denied. Enable in Settings.");
+        state = state.copyWith(
+          statusMessage: "Bluetooth permission denied. Enable in Settings.",
+        );
         return;
       }
     } else {
@@ -328,12 +383,17 @@ class PodNotifier extends Notifier<PodState> {
     await requestBatteryExemption();
 
     // 3. Preserve currently connected device (Prevent UI flicker)
-    final connectedDevices = state.scannedDevices.where(
-      (device) => device['id'] == state.connectedDeviceId
-    ).toList();
-    
-    state = state.copyWith(isScanning: true, scannedDevices: connectedDevices, statusMessage: "Scanning...");
-    
+    final connectedDevices =
+        state.scannedDevices
+            .where((device) => device['id'] == state.connectedDeviceId)
+            .toList();
+
+    state = state.copyWith(
+      isScanning: true,
+      scannedDevices: connectedDevices,
+      statusMessage: "Scanning...",
+    );
+
     // 4. Check for Auto-Connect preference
     final prefs = await SharedPreferences.getInstance();
     final lastId = prefs.getString('last_pod_id');
@@ -345,7 +405,9 @@ class PodNotifier extends Notifier<PodState> {
       final name = (deviceMap['name'] as String).toUpperCase();
 
       if (name.startsWith("POD")) {
-        final currentList = List<Map<String, dynamic>>.from(state.scannedDevices);
+        final currentList = List<Map<String, dynamic>>.from(
+          state.scannedDevices,
+        );
 
         final existingIdx = currentList.indexWhere((d) => d['id'] == id);
         if (existingIdx == -1) {
@@ -364,9 +426,12 @@ class PodNotifier extends Notifier<PodState> {
         );
 
         // Auto-Connect Logic
-        if (lastId != null && id == lastId && !_hasAutoConnected && state.connectedDeviceId == null) {
-           _hasAutoConnected = true;
-           connect(id);
+        if (lastId != null &&
+            id == lastId &&
+            !_hasAutoConnected &&
+            state.connectedDeviceId == null) {
+          _hasAutoConnected = true;
+          connect(id);
         }
       }
     });
@@ -379,8 +444,12 @@ class PodNotifier extends Notifier<PodState> {
     _scanTimer = Timer(const Duration(seconds: 15), () {
       // Only update if we are still scanning to avoid weird state jumps
       if (state.isScanning) {
-        state = state.copyWith(isScanning: false, statusMessage: "Scan Complete");
-        _scanSub?.cancel(); // Optional: Stop listening to the stream since native stopped sending
+        state = state.copyWith(
+          isScanning: false,
+          statusMessage: "Scan Complete",
+        );
+        _scanSub
+            ?.cancel(); // Optional: Stop listening to the stream since native stopped sending
       }
     });
   }
@@ -414,7 +483,7 @@ class PodNotifier extends Notifier<PodState> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('last_pod_id', id);
       state = state.copyWith(connectedDeviceId: id);
-      
+
       // Wait for connection stability before asking for data
       await Future.delayed(const Duration(seconds: 1));
       getDeviceSettings();
@@ -427,7 +496,7 @@ class PodNotifier extends Notifier<PodState> {
   /// Disconnects from the current device and removes the auto-connect preference.
   Future<void> disconnect() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('last_pod_id'); 
+    await prefs.remove('last_pod_id');
     await _native.disconnect();
   }
 
@@ -439,21 +508,26 @@ class PodNotifier extends Notifier<PodState> {
   Future<void> toggleRecording() async {
     if (state.isRecording) {
       // --- STOP RECORDING ---
-      state = state.copyWith(isRecording: false, statusMessage: "Saving Live Session...");
-      
+      state = state.copyWith(
+        isRecording: false,
+        statusMessage: "Saving Live Session...",
+      );
+
       // 1. Tell Pod to stop streaming
       await setLiveStream(false);
 
       // 2. Save the buffered data to a CSV
       if (_liveSessionBuffer.isNotEmpty) {
         final startTime = DateTime.now();
-        
+
         // Format Time: HHMMSS (e.g., 143005)
-        final timeStr = "${startTime.hour.toString().padLeft(2,'0')}${startTime.minute.toString().padLeft(2,'0')}${startTime.second.toString().padLeft(2,'0')}";
-        
+        final timeStr =
+            "${startTime.hour.toString().padLeft(2, '0')}${startTime.minute.toString().padLeft(2, '0')}${startTime.second.toString().padLeft(2, '0')}";
+
         // Naming: LiveRec_Player[ID]_[Time].csv
-        final fileName = "LiveRec_Player${state.settingsPlayerNumber}_$timeStr.csv";
-        
+        final fileName =
+            "LiveRec_Player${state.settingsPlayerNumber}_$timeStr.csv";
+
         try {
           // Save the buffer to a .csv file
           await _storage.saveLiveTelemetryToCsv(_liveSessionBuffer, fileName);
@@ -464,17 +538,16 @@ class PodNotifier extends Notifier<PodState> {
       } else {
         state = state.copyWith(statusMessage: "Recording Stopped (Empty)");
       }
-      
+
       // 3. Cleanup
       _liveSessionBuffer.clear();
-
     } else {
       // Start recording
       _liveSessionBuffer.clear();
-      
+
       // 1. Update UI State
       state = state.copyWith(isRecording: true, statusMessage: "Recording...");
-      
+
       // 2. Tell Pod to start streaming live data
       await setLiveStream(true);
     }
@@ -490,11 +563,19 @@ class PodNotifier extends Notifier<PodState> {
   // ===========================================================================
 
   /// Orchestrates the batch download of multiple log files from the Pod.
- Future<void> syncAllFiles(List<String> filesToSync, {DateTime? start, DateTime? end}) async {
+  Future<void> syncAllFiles(
+    List<String> filesToSync, {
+    DateTime? start,
+    DateTime? end,
+  }) async {
     _isCancellingDownload = false;
     List<SensorLog> masterSessionLogs = [];
 
-    PodLogger.info('sync', 'Starting batch sync', detail: '${filesToSync.length} files');
+    PodLogger.info(
+      'sync',
+      'Starting batch sync',
+      detail: '${filesToSync.length} files',
+    );
 
     // Download loop
     for (int i = 0; i < filesToSync.length; i++) {
@@ -514,19 +595,23 @@ class PodNotifier extends Notifier<PodState> {
       try {
         // Download individual file (with timeout and progress tracking)
         List<SensorLog> fileLogs = await downloadLogFile(
-          fileName, 
+          fileName,
           start: start,
           end: end,
-          totalFiles: filesToSync.length, 
-          currentIndex: currentIndex
+          totalFiles: filesToSync.length,
+          currentIndex: currentIndex,
         );
-        
+
         if (fileLogs.isNotEmpty) {
-           masterSessionLogs.addAll(fileLogs);
+          masterSessionLogs.addAll(fileLogs);
         }
       } catch (e) {
         // Log error but continue to next file (Best Effort Strategy)
-        PodLogger.error('sync', 'Failed to download file', detail: '$fileName: $e');
+        PodLogger.error(
+          'sync',
+          'Failed to download file',
+          detail: '$fileName: $e',
+        );
       }
     }
 
@@ -553,31 +638,46 @@ class PodNotifier extends Notifier<PodState> {
       }
     }
     if (deduped.length < masterSessionLogs.length) {
-      PodLogger.info('sync', 'Deduplicated logs', detail: 'removed ${masterSessionLogs.length - deduped.length} duplicates');
+      PodLogger.info(
+        'sync',
+        'Deduplicated logs',
+        detail:
+            'removed ${masterSessionLogs.length - deduped.length} duplicates',
+      );
     }
     masterSessionLogs = deduped;
 
     final startTime = masterSessionLogs.first.timestamp;
     // Format: YYYYMMDD_HHMM
-    final formattedTime = "${startTime.year}${startTime.month.toString().padLeft(2,'0')}${startTime.day.toString().padLeft(2,'0')}_${startTime.hour.toString().padLeft(2,'0')}${startTime.minute.toString().padLeft(2,'0')}";
-    
+    final formattedTime =
+        "${startTime.year}${startTime.month.toString().padLeft(2, '0')}${startTime.day.toString().padLeft(2, '0')}_${startTime.hour.toString().padLeft(2, '0')}${startTime.minute.toString().padLeft(2, '0')}";
+
     // Naming: Player_X_YYYYMMDD_HHMM_Raw.csv
-    String pNum = state.settingsPlayerNumber > 0 ? "Player_${state.settingsPlayerNumber}" : "Player_Unknown";
+    String pNum =
+        state.settingsPlayerNumber > 0
+            ? "Player_${state.settingsPlayerNumber}"
+            : "Player_Unknown";
     String finalName = "${pNum}_${formattedTime}_Raw.csv";
-    
+
     // --- 4. SAVE RAW ARCHIVE ---
     await _storage.saveSensorLogsToCsv(masterSessionLogs, finalName);
-    
+
     // --- 5. INTELLIGENT CLUSTERING ---
     // Analyze the time gaps. If we find gaps > 5 minutes, split them into separate "Sessions".
     final rawClusters = SessionClusterer.cluster(masterSessionLogs);
 
     if (rawClusters.length > 1) {
-       // Multiple sessions found (e.g., Morning Run + Afternoon Run downloaded together)
-       state = state.copyWith(statusMessage: "Multi-Session Detected!", rawClusters: rawClusters);
+      // Multiple sessions found (e.g., Morning Run + Afternoon Run downloaded together)
+      state = state.copyWith(
+        statusMessage: "Multi-Session Detected!",
+        rawClusters: rawClusters,
+      );
     } else {
-       // Single contiguous session
-       state = state.copyWith(statusMessage: "Saved: $finalName", rawClusters: []);
+      // Single contiguous session
+      state = state.copyWith(
+        statusMessage: "Saved: $finalName",
+        rawClusters: [],
+      );
     }
   }
 
@@ -585,33 +685,44 @@ class PodNotifier extends Notifier<PodState> {
   Future<List<List<SensorLog>>> analyzeSavedFile(File file) async {
     state = state.copyWith(statusMessage: "Analyzing File...");
     final logs = await _storage.readCsvFile(file);
-    
+
     if (logs.isEmpty) {
       state = state.copyWith(statusMessage: "File unreadable");
       return [];
     }
 
     final clusters = SessionClusterer.cluster(logs);
-    state = state.copyWith(statusMessage: "Found ${clusters.length} sessions", rawClusters: clusters);
+    state = state.copyWith(
+      statusMessage: "Found ${clusters.length} sessions",
+      rawClusters: clusters,
+    );
     return clusters;
   }
 
   /// Saves user-defined split sessions (SessionBlocks) to storage.
-  Future<void> saveSplitSessions(List<SessionBlock> blocks, List<String> labels, String playerName) async {
+  Future<void> saveSplitSessions(
+    List<SessionBlock> blocks,
+    List<String> labels,
+    String playerName,
+  ) async {
     state = state.copyWith(statusMessage: "Saving Splits...");
     try {
       for (int i = 0; i < blocks.length; i++) {
         final block = blocks[i];
         final label = labels[i];
-        
+
         final st = block.startTime;
-        final timeStr = "${st.year}${st.month.toString().padLeft(2,'0')}${st.day.toString().padLeft(2,'0')}_${st.hour.toString().padLeft(2,'0')}${st.minute.toString().padLeft(2,'0')}";
+        final timeStr =
+            "${st.year}${st.month.toString().padLeft(2, '0')}${st.day.toString().padLeft(2, '0')}_${st.hour.toString().padLeft(2, '0')}${st.minute.toString().padLeft(2, '0')}";
         final cleanLabel = label.replaceAll(" ", "");
-        
+
         final fileName = "${playerName}_${timeStr}_$cleanLabel.csv";
         await _storage.saveSensorLogsToCsv(block.logs, fileName);
       }
-      state = state.copyWith(statusMessage: "Saved ${blocks.length} split files.", rawClusters: []);
+      state = state.copyWith(
+        statusMessage: "Saved ${blocks.length} split files.",
+        rawClusters: [],
+      );
     } catch (e) {
       state = state.copyWith(statusMessage: "Error saving splits: $e");
     }
@@ -620,10 +731,11 @@ class PodNotifier extends Notifier<PodState> {
   // ===========================================================================
   // 5. DOWNLOAD HELPER
   // ===========================================================================
-  
+
   /// Helper function that wraps the native file download stream in a [Future].
   /// Retries up to [maxRetries] times with exponential backoff on failure.
-  Future<List<SensorLog>> downloadLogFile(String fileInfo, {
+  Future<List<SensorLog>> downloadLogFile(
+    String fileInfo, {
     DateTime? start,
     DateTime? end,
     int totalFiles = 1,
@@ -633,30 +745,60 @@ class PodNotifier extends Notifier<PodState> {
     int startMillis = start?.millisecondsSinceEpoch ?? 0;
     int endMillis = end?.millisecondsSinceEpoch ?? 0;
 
-    PodLogger.info('sync', 'downloadLogFile', detail: 'file="$fileInfo", filter=[${startMillis > 0 ? DateTime.fromMillisecondsSinceEpoch(startMillis).toIso8601String() : "none"}..${endMillis > 0 ? DateTime.fromMillisecondsSinceEpoch(endMillis).toIso8601String() : "none"}], idx=$currentIndex/$totalFiles');
+    PodLogger.info(
+      'sync',
+      'downloadLogFile',
+      detail:
+          'file="$fileInfo", filter=[${startMillis > 0 ? DateTime.fromMillisecondsSinceEpoch(startMillis).toIso8601String() : "none"}..${endMillis > 0 ? DateTime.fromMillisecondsSinceEpoch(endMillis).toIso8601String() : "none"}], idx=$currentIndex/$totalFiles',
+    );
 
     for (int attempt = 0; attempt <= maxRetries; attempt++) {
       // Cancel any in-flight native download before retrying
       if (attempt > 0) {
-        PodLogger.info('sync', 'Retry attempt', detail: '$attempt/$maxRetries for "$fileInfo"');
+        PodLogger.info(
+          'sync',
+          'Retry attempt',
+          detail: '$attempt/$maxRetries for "$fileInfo"',
+        );
         await _native.cancelDownload();
         await Future.delayed(const Duration(milliseconds: 500));
       }
 
       _syncCompleter = Completer<List<SensorLog>>();
-      state = state.copyWith(downloadedFileBytes: null, statusMessage: attempt > 0
-          ? "Retrying ($attempt/$maxRetries)..."
-          : "Requesting Data...");
+      state = state.copyWith(
+        downloadedFileBytes: null,
+        statusMessage:
+            attempt > 0
+                ? "Retrying ($attempt/$maxRetries)..."
+                : "Requesting Data...",
+      );
 
       try {
-        await _native.downloadFile(fileInfo, startMillis, endMillis, totalFiles, currentIndex);
+        await _native.downloadFile(
+          fileInfo,
+          startMillis,
+          endMillis,
+          totalFiles,
+          currentIndex,
+        );
         final stopwatch = Stopwatch()..start();
-        final result = await _syncCompleter!.future.timeout(const Duration(minutes: 45));
+        final result = await _syncCompleter!.future.timeout(
+          const Duration(minutes: 45),
+        );
         stopwatch.stop();
-        PodLogger.info('sync', 'Download complete', detail: '"$fileInfo" → ${result.length} records in ${stopwatch.elapsed.inSeconds}s');
+        PodLogger.info(
+          'sync',
+          'Download complete',
+          detail:
+              '"$fileInfo" → ${result.length} records in ${stopwatch.elapsed.inSeconds}s',
+        );
         return result;
       } catch (e) {
-        PodLogger.warn('sync', 'Download attempt failed', detail: 'attempt=${attempt + 1}: $e');
+        PodLogger.warn(
+          'sync',
+          'Download attempt failed',
+          detail: 'attempt=${attempt + 1}: $e',
+        );
         // Don't retry if the connection was lost — retries won't help
         if (state.connectedDeviceId == null) {
           PodLogger.warn('sync', 'Connection lost, skipping retries');
@@ -713,35 +855,39 @@ class PodNotifier extends Notifier<PodState> {
     // 2. Prepare Command
     String cleanName = fileInfo.split('(')[0].trim();
     List<int> nameBytes = ascii.encode(cleanName);
-    
+
     // Ensure 32-byte padding
-    List<int> paddedName = List<int>.filled(32, 0); 
-    for(int i=0; i<nameBytes.length && i<32; i++) {
-        paddedName[i] = nameBytes[i];
+    List<int> paddedName = List<int>.filled(32, 0);
+    for (int i = 0; i < nameBytes.length && i < 32; i++) {
+      paddedName[i] = nameBytes[i];
     }
 
-    await _write([0x07, 0x20, ...paddedName]); 
+    await _write([0x07, 0x20, ...paddedName]);
     await Future.delayed(const Duration(seconds: 2));
-    await getLogFilesInfo(); 
+    await getLogFilesInfo();
   }
 
   Future<void> cancelDownload() async {
     _isCancellingDownload = true;
-    await _write([0x08, 0x00]); 
-    
+    await _write([0x08, 0x00]);
+
     state = state.copyWith(statusMessage: "Download Cancelled");
     if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
       _syncCompleter!.completeError("Cancelled");
     }
-    Future.delayed(const Duration(seconds: 1), () => _isCancellingDownload = false);
+    Future.delayed(
+      const Duration(seconds: 1),
+      () => _isCancellingDownload = false,
+    );
   }
 
   Future<void> getDeviceSettings() async {
     state = state.copyWith(isLoadingSettings: true);
-    await _write([0x09, 0x00]); 
-    
+    await _write([0x09, 0x00]);
+
     Future.delayed(const Duration(seconds: 3), () {
-      if (state.isLoadingSettings) state = state.copyWith(isLoadingSettings: false);
+      if (state.isLoadingSettings)
+        state = state.copyWith(isLoadingSettings: false);
     });
   }
 
@@ -754,7 +900,7 @@ class PodNotifier extends Notifier<PodState> {
 
   Future<void> setLogInterval(int intervalMs) async {
     if (intervalMs < 100 || intervalMs > 1000) return;
-    
+
     int lsb = intervalMs & 0xFF;
     int msb = (intervalMs >> 8) & 0xFF;
 
@@ -764,4 +910,6 @@ class PodNotifier extends Notifier<PodState> {
   }
 }
 
-final podNotifierProvider = NotifierProvider<PodNotifier, PodState>(PodNotifier.new);
+final podNotifierProvider = NotifierProvider<PodNotifier, PodState>(
+  PodNotifier.new,
+);

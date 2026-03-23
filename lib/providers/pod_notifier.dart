@@ -11,6 +11,7 @@ import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:metric_athlete_pod_ble/utils/ble_command_queue.dart';
+import 'package:metric_athlete_pod_ble/utils/filter_pipeline.dart';
 import 'package:metric_athlete_pod_ble/utils/pod_protocol_decoder.dart';
 
 /// The central State Management class for the Pod Connector application.
@@ -171,10 +172,11 @@ class PodNotifier extends Notifier<PodState> {
 
             try {
               // --- 🚀 PERFORMANCE FIX: RUN FILTER IN BACKGROUND ---
-              // We use compute() to prevent the UI from freezing while calculating
-              // the Kalman Filter and interpolating gaps.
-              final TrajectoryResult result = await compute(
-                TrajectoryFilter.process,
+              // Uses FilterPipeline with Kalman+RTS DISABLED by default.
+              // Raw GPS positions give ~10% more accurate haversine distance.
+              // Butterworth IMU filter still runs for accurate player load.
+              final FilterPipelineResult result = await compute(
+                FilterPipeline.process,
                 rawLogs,
               );
 

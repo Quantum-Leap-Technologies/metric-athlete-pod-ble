@@ -292,6 +292,125 @@ class TrajectoryFilter {
     );
   }
 
+  /// Lightweight pipeline: sanity check + gap repair only (no Kalman+RTS).
+  ///
+  /// Use this when raw GPS positions are preferred for distance calculation.
+  /// Raw haversine gives ~10% more accurate distance than Kalman-smoothed
+  /// positions because the Kalman filter compresses the GPS trajectory.
+  static TrajectoryResult sanitizeAndRepairOnly(
+    List<SensorLog> logs,
+    TrajectoryConfig config,
+  ) {
+    if (logs.isEmpty) {
+      return TrajectoryResult(
+        logs: [],
+        healthScore: 0,
+        originalCount: 0,
+        repairedCount: 0,
+      );
+    }
+
+    // STAGE -1: Sanity check
+    final cleanLogs = logs.where((log) => _isLogValid(log)).toList();
+    if (cleanLogs.isEmpty) {
+      return TrajectoryResult(
+        logs: [],
+        healthScore: 0,
+        originalCount: 0,
+        repairedCount: 0,
+      );
+    }
+
+    // STAGE 0: Sort, dedup, repair (same logic as processWithConfig)
+    final sortedLogs = List<SensorLog>.from(cleanLogs)
+      ..sort((a, b) => a.packetId.compareTo(b.packetId));
+
+    final dedupedLogs = <SensorLog>[];
+    for (int i = 0; i < sortedLogs.length; i++) {
+      if (i + 1 < sortedLogs.length &&
+          sortedLogs[i].packetId == sortedLogs[i + 1].packetId) {
+        continue;
+      }
+      dedupedLogs.add(sortedLogs[i]);
+    }
+
+    int kernelStepSize = 100;
+    final sampleSize = min(dedupedLogs.length, 51);
+    if (sampleSize >= 2) {
+      List<int> diffs = [];
+      for (int i = 1; i < sampleSize; i++) {
+        int d = dedupedLogs[i].packetId - dedupedLogs[i - 1].packetId;
+        if (d > 0 && d < 5000) diffs.add(d);
+      }
+      if (diffs.length >= 3) {
+        diffs.sort();
+        final q1 = diffs[diffs.length ~/ 4];
+        final q3 = diffs[(diffs.length * 3) ~/ 4];
+        final iqr = q3 - q1;
+        final lowerBound = q1 - 1.5 * iqr;
+        final upperBound = q3 + 1.5 * iqr;
+        final filtered =
+            diffs.where((d) => d >= lowerBound && d <= upperBound).toList();
+        kernelStepSize =
+            filtered.isNotEmpty
+                ? filtered[filtered.length ~/ 2]
+                : diffs[diffs.length ~/ 2];
+      } else if (diffs.isNotEmpty) {
+        diffs.sort();
+        kernelStepSize = diffs[diffs.length ~/ 2];
+      }
+    }
+
+    final repairedLogs = <SensorLog>[];
+    int repairedCount = 0;
+    DateTime currentTime = dedupedLogs.first.timestamp;
+    repairedLogs.add(dedupedLogs.first.copyWith(timestamp: currentTime));
+
+    for (int i = 1; i < dedupedLogs.length; i++) {
+      final prev = dedupedLogs[i - 1];
+      final curr = dedupedLogs[i];
+      int idDiff = curr.packetId - prev.packetId;
+      int steps = (idDiff / kernelStepSize).round();
+
+      if (steps > 1 && steps < 500) {
+        int missingPackets = steps - 1;
+        repairedCount += missingPackets;
+        for (int s = 1; s < steps; s++) {
+          double ratio = s / steps;
+          DateTime interpTime = currentTime.add(
+            Duration(milliseconds: s * 100),
+          );
+          int newId = prev.packetId + (s * kernelStepSize);
+          repairedLogs.add(
+            _interpolateLog(prev, curr, ratio, interpTime, newId),
+          );
+        }
+        currentTime = currentTime.add(Duration(milliseconds: steps * 100));
+      } else {
+        if (steps >= 500) {
+          currentTime = curr.timestamp;
+        } else {
+          currentTime = currentTime.add(const Duration(milliseconds: 100));
+        }
+      }
+      repairedLogs.add(curr.copyWith(timestamp: currentTime));
+    }
+
+    int totalOutput = repairedLogs.length;
+    double health =
+        totalOutput > 0
+            ? ((totalOutput - repairedCount) / totalOutput) * 100.0
+            : 0;
+
+    // Skip Stage 1-2 (Kalman+RTS) — return sanitized + gap-repaired logs
+    return TrajectoryResult(
+      logs: repairedLogs,
+      healthScore: health,
+      originalCount: cleanLogs.length,
+      repairedCount: repairedCount,
+    );
+  }
+
   /// VALIDATION LOGIC
   /// Returns 'false' if the packet contains corrupted or physically impossible data.
   /// Used in Stage -1 to filter out "gibberish" before processing.

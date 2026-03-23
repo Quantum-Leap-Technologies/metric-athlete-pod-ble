@@ -40,8 +40,8 @@ class FilterConfig {
     this.enableSanityCheck = true,
     this.enableGapRepair = true,
     this.enableButterworth = true,
-    this.enableKalmanRts = true,
-    this.enableOutlierRejection = true,
+    this.enableKalmanRts = false,
+    this.enableOutlierRejection = false,
     this.butterworthCutoffHz = 5.0,
     this.butterworthSamplingHz = 10.0,
     this.maxGpsJumpMeters = 1.0,
@@ -99,12 +99,26 @@ class FilterPipeline {
       );
     }
 
-    // Run the existing TrajectoryFilter (Stages -1, 0, 1-2)
-    // It handles sanity check, gap repair, and Kalman+RTS internally
+    // Run TrajectoryFilter stages selectively.
+    // When Kalman+RTS is disabled, only run sanity check + gap repair
+    // (raw GPS positions give ~10% more accurate haversine distance).
     final trajectoryConfig =
         config.trajectoryConfig ?? const TrajectoryConfig();
-    final TrajectoryResult trajectoryResult =
-        TrajectoryFilter.processWithConfig(logs, trajectoryConfig);
+    final TrajectoryResult trajectoryResult;
+
+    if (config.enableKalmanRts) {
+      // Full pipeline: sanity + gap repair + Kalman+RTS
+      trajectoryResult = TrajectoryFilter.processWithConfig(
+        logs,
+        trajectoryConfig,
+      );
+    } else {
+      // Lightweight: sanity + gap repair only (skip GPS smoothing)
+      trajectoryResult = TrajectoryFilter.sanitizeAndRepairOnly(
+        logs,
+        trajectoryConfig,
+      );
+    }
 
     List<SensorLog> processedLogs = trajectoryResult.logs;
     int outliersCorrected = 0;

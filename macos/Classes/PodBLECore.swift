@@ -540,9 +540,24 @@ extension PodBLECore: CBCentralManagerDelegate {
                          advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "Unknown"
 
-        if name.uppercased().hasPrefix("POD") {
+        let nameMatch = name.uppercased().hasPrefix("POD")
+
+        let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        let serviceMatch = advertisedServices.contains(serviceUUID)
+
+        if nameMatch || serviceMatch {
+            let displayName: String
+            if nameMatch {
+                displayName = name
+            } else {
+                displayName = "POD-\(peripheral.identifier.uuidString.prefix(8))"
+            }
+
+            let matchReason = nameMatch && serviceMatch ? "name+serviceUUID" : (nameMatch ? "name" : "serviceUUID")
+            NSLog("[PodBLE] didDiscover — name='%@' id='%@' rssi=%d match=%@", displayName, peripheral.identifier.uuidString, RSSI.intValue, matchReason)
+
             delegate?.didDiscoverDevice(
-                name: name,
+                name: displayName,
                 id: peripheral.identifier.uuidString,
                 rssi: RSSI.intValue
             )

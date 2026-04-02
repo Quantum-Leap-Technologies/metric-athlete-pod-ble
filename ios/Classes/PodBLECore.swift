@@ -175,7 +175,8 @@ class PodBLECore: NSObject {
                   let peripheral = self.connectedPeripheral,
                   let characteristic = self.writeCharacteristic else {
                 if data.count > 0 {
-                    NSLog("[PodBLE] writeCommand — DROPPED cmd=0x%02X (%d bytes), no connection/characteristic", data[0], data.count)
+                    NSLog("[PodBLE] writeCommand — DROPPED cmd=0x%02X (%d bytes), no connection/characteristic, notify=%@",
+                          data[0], data.count, self?.notifyCharacteristic != nil ? "YES" : "NO")
                 }
                 return
             }
@@ -183,9 +184,8 @@ class PodBLECore: NSObject {
             // All App-to-POD messages require: [0xAE, message_type, payload_length, ...payload]
             var packet = Data([0xAE])
             packet.append(data)
-            if data.count > 0 {
-                NSLog("[PodBLE] writeCommand — cmd=0x%02X (%d bytes, with 0xAE header)", data[0], packet.count)
-            }
+            let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+            NSLog("[PodBLE] writeCommand — sending [%@] (%d bytes)", hex, packet.count)
             peripheral.writeValue(packet, for: characteristic, type: .withResponse)
         }
     }
@@ -690,6 +690,23 @@ extension PodBLECore: CBPeripheralDelegate {
         }
     }
 
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            NSLog("[PodBLE] didWriteValue — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
+        } else {
+            NSLog("[PodBLE] didWriteValue — write confirmed for %@", characteristic.uuid.uuidString)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            NSLog("[PodBLE] didUpdateNotificationState — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
+        } else {
+            NSLog("[PodBLE] didUpdateNotificationState — notify=%@ for %@",
+                  characteristic.isNotifying ? "ON" : "OFF", characteristic.uuid.uuidString)
+        }
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             // Notification read failed — device may have disconnected
@@ -698,6 +715,9 @@ extension PodBLECore: CBPeripheralDelegate {
         }
         guard characteristic.uuid == notifyCharUUID,
               let data = characteristic.value, !data.isEmpty else { return }
+
+        let hex = data.prefix(20).map { String(format: "%02X", $0) }.joined(separator: " ")
+        NSLog("[PodBLE] didUpdateValue — received %d bytes: [%@%@]", data.count, hex, data.count > 20 ? "..." : "")
 
         lastPacketTime = Date()
 

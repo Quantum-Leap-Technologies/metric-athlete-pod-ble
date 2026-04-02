@@ -303,13 +303,26 @@ class PodNotifier extends Notifier<PodState> {
         PodLogger.warn('ble', 'Empty payload received');
         return;
       }
+
+      // Per BLE ICD V3.6, pod-to-app messages start with 0xAE header.
+      // Strip it to get the actual message type and payload.
+      Uint8List messageData = payload;
+      if (payload.length >= 2 && payload[0] == 0xAE) {
+        messageData = payload.sublist(1);
+      }
+
+      if (messageData.isEmpty) {
+        PodLogger.warn('ble', 'Empty payload after header strip');
+        return;
+      }
+
       PodLogger.debug(
         'protocol',
         'Payload received',
         detail:
-            'type=0x${payload[0].toRadixString(16).padLeft(2, '0')}, size=${payload.length} bytes',
+            'type=0x${messageData[0].toRadixString(16).padLeft(2, '0')}, size=${messageData.length} bytes',
       );
-      _protocolHandler.handleMessage(payload[0], payload.sublist(1));
+      _protocolHandler.handleMessage(messageData[0], messageData.sublist(1));
     });
   }
 

@@ -179,10 +179,14 @@ class PodBLECore: NSObject {
                 }
                 return
             }
+            // Prepend 0xAE message header per BLE ICD V3.6 protocol spec.
+            // All App-to-POD messages require: [0xAE, message_type, payload_length, ...payload]
+            var packet = Data([0xAE])
+            packet.append(data)
             if data.count > 0 {
-                NSLog("[PodBLE] writeCommand — cmd=0x%02X (%d bytes)", data[0], data.count)
+                NSLog("[PodBLE] writeCommand — cmd=0x%02X (%d bytes, with 0xAE header)", data[0], packet.count)
             }
-            peripheral.writeValue(data, for: characteristic, type: .withResponse)
+            peripheral.writeValue(packet, for: characteristic, type: .withResponse)
         }
     }
 

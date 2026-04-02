@@ -309,6 +309,8 @@ winrt::fire_and_forget PodBLECore::WriteCommand(const std::vector<uint8_t>& data
     try {
         DataWriter writer;
         writer.ByteOrder(ByteOrder::LittleEndian);
+        // Prepend 0xAE message header per BLE ICD V3.6 protocol spec.
+        writer.WriteByte(0xAE);
         writer.WriteBytes(data);
         auto buffer = writer.DetachBuffer();
 

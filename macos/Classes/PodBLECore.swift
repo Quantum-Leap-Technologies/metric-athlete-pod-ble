@@ -33,6 +33,7 @@ class PodBLECore: NSObject {
     private var notifyCharacteristic: CBCharacteristic?
 
     private let bleQueue = DispatchQueue(label: "com.pod_connector.ble", qos: .userInitiated)
+    private let processingQueue = DispatchQueue(label: "com.pod_connector.processing", qos: .userInitiated)
 
     // Scanning
     private var scanTimer: Timer?
@@ -646,8 +647,11 @@ extension PodBLECore: CBPeripheralDelegate {
             }
         }
 
-        NSLog("[PodBLE] didDiscoverCharacteristics — total=%d, notify=%@, write=%@",
-              characteristics.count, foundNotify ? "YES" : "NO", foundWrite ? "YES" : "NO")
+        let mtuWithResponse = peripheral.maximumWriteValueLength(for: .withResponse)
+        let mtuWithoutResponse = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        NSLog("[PodBLE] didDiscoverCharacteristics — total=%d, notify=%@, write=%@, MTU(withResp)=%d, MTU(noResp)=%d",
+              characteristics.count, foundNotify ? "YES" : "NO", foundWrite ? "YES" : "NO",
+              mtuWithResponse, mtuWithoutResponse)
 
         if !foundNotify || !foundWrite {
             NSLog("[PodBLE] WARNING — missing characteristics! Available UUIDs: %@",
@@ -673,8 +677,11 @@ extension PodBLECore: CBPeripheralDelegate {
 
         // Route packets: download reassembly vs direct passthrough
         if isDownloadActive || totalExpectedPackets > 0 || receivedPacketCount > 0 {
-            // Active download — route through packet reassembly
-            processPacket(data)
+            // Active download — route through processing queue to avoid blocking BLE thread
+            let packetCopy = Data(data)
+            processingQueue.async { [weak self] in
+                self?.processPacket(packetCopy)
+            }
         } else {
             // Not downloading — pass through directly (live telemetry, file list, settings, etc.)
             DispatchQueue.main.async { [weak self] in

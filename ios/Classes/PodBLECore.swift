@@ -273,27 +273,33 @@ class PodBLECore: NSObject {
             return
         }
 
+        // Strip 0xAE header from pod responses (ICD V3.6)
+        let data: Data
+        if packet.count >= 2 && packet[0] == 0xAE {
+            data = packet.subdata(in: 1..<packet.count)
+        } else {
+            data = packet
+        }
+
         if receivedPacketCount == 0 {
             // First packet (header)
-            guard packet.count >= 9 else {
-                NSLog("[PodBLE] processPacket — DROPPED first packet: too short for header (%d bytes)", packet.count)
+            guard data.count >= 8 else {
+                NSLog("[PodBLE] processPacket — DROPPED first packet: too short for header (%d bytes after 0xAE strip)", data.count)
                 return
             }
 
-            let type = packet[0]
+            let type = data[0]
             currentMessageType = type
 
-            // Read total expected packets (bytes 5-8, little endian)
-            totalExpectedPackets = Int(packet.subdata(in: 5..<9).withUnsafeBytes {
+            // Read total expected packets (bytes 4-7 of stripped data, little endian)
+            totalExpectedPackets = Int(data.subdata(in: 4..<8).withUnsafeBytes {
                 $0.load(as: UInt32.self).littleEndian
             })
 
-            NSLog("[PodBLE] processPacket — HEADER: type=0x%02X, expectedPackets=%d, packetSize=%d",
-                  type, totalExpectedPackets, packet.count)
+            NSLog("[PodBLE] processPacket — HEADER: type=0x%02X, expectedPackets=%d, dataSize=%d",
+                  type, totalExpectedPackets, data.count)
 
             // Sanity check — reject obviously corrupt headers.
-            // A 2-hour session at 10 Hz ≈ 72 000 entries × ~64 bytes ≈ 72 000 packets.
-            // Cap at 500 000 to allow headroom but prevent multi-GB allocations.
             let maxReasonablePackets = 500_000
             guard totalExpectedPackets > 0 && totalExpectedPackets <= maxReasonablePackets else {
                 NSLog("[PodBLE] processPacket — REJECTED: unreasonable packet count %d (max=%d)", totalExpectedPackets, maxReasonablePackets)
@@ -308,22 +314,22 @@ class PodBLECore: NSObject {
 
             payloadBuffer.append(currentMessageType)
 
-            if packet.count > 9 {
-                payloadBuffer.append(packet.subdata(in: 9..<packet.count))
+            if data.count > 8 {
+                payloadBuffer.append(data.subdata(in: 8..<data.count))
             }
             receivedPacketCount = 1
 
         } else {
-            // Subsequent packet
-            if packet.count > 5 {
-                payloadBuffer.append(packet.subdata(in: 5..<packet.count))
+            // Subsequent packet — strip 5-byte BLE framing header
+            if data.count > 4 {
+                payloadBuffer.append(data.subdata(in: 4..<data.count))
             }
             receivedPacketCount += 1
         }
 
         // Auto-detect packet size from first packet
         if actualPacketSize == 0 {
-            actualPacketSize = packet.count
+            actualPacketSize = packet.count // Use raw packet size for MTU detection
         }
 
         // Smart Peek

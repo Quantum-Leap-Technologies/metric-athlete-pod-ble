@@ -75,13 +75,23 @@ class BinaryParser {
   /// | 43 | Gyro Z | Float32 | 4 |
   static List<SensorLog> parseBytes(Uint8List rawBytes) {
     final detectedSize = _detectPacketSize(rawBytes);
-    PodLogger.info('parser', 'Detected packet size', detail: '${detectedSize}B, totalPayload=${rawBytes.length}B, estRecords=${rawBytes.length ~/ detectedSize}');
-    final logs = detectedSize == v01DataSize
-        ? _parseV01(rawBytes, detectedSize)
-        : _parse(rawBytes, detectedSize);
+    PodLogger.info(
+      'parser',
+      'Detected packet size',
+      detail:
+          '${detectedSize}B, totalPayload=${rawBytes.length}B, estRecords=${rawBytes.length ~/ detectedSize}',
+    );
+    final logs =
+        detectedSize == v01DataSize
+            ? _parseV01(rawBytes, detectedSize)
+            : _parse(rawBytes, detectedSize);
     if (logs.isNotEmpty) {
-      PodLogger.info('parser', 'Parse result',
-          detail: '${logs.length} records, first=${logs.first.timestamp.toIso8601String()}, last=${logs.last.timestamp.toIso8601String()}');
+      PodLogger.info(
+        'parser',
+        'Parse result',
+        detail:
+            '${logs.length} records, first=${logs.first.timestamp.toIso8601String()}, last=${logs.last.timestamp.toIso8601String()}',
+      );
     }
     return logs;
   }
@@ -190,22 +200,24 @@ class BinaryParser {
         final double filtAy = data.getFloat32(offset + 53, Endian.little);
         final double filtAz = data.getFloat32(offset + 57, Endian.little);
 
-        logs.add(SensorLog(
-          packetId: kernelTick,
-          timestamp: dt,
-          latitude: lat,
-          longitude: lon,
-          speed: speed,
-          accelX: ax,
-          accelY: ay,
-          accelZ: az,
-          gyroX: gx,
-          gyroY: gy,
-          gyroZ: gz,
-          filteredAccelX: filtAx,
-          filteredAccelY: filtAy,
-          filteredAccelZ: filtAz,
-        ));
+        logs.add(
+          SensorLog(
+            packetId: kernelTick,
+            timestamp: dt,
+            latitude: lat,
+            longitude: lon,
+            speed: speed,
+            accelX: ax,
+            accelY: ay,
+            accelZ: az,
+            gyroX: gx,
+            gyroY: gy,
+            gyroZ: gz,
+            filteredAccelX: filtAx,
+            filteredAccelY: filtAy,
+            filteredAccelZ: filtAz,
+          ),
+        );
 
         offset += stepSize;
       } catch (e) {
@@ -215,7 +227,12 @@ class BinaryParser {
     }
 
     if (syncSkips > 0 || parseErrors > 0) {
-      PodLogger.warn('parser', 'Parse anomalies', detail: 'syncSkips=$syncSkips, parseErrors=$parseErrors, goodRecords=${logs.length}');
+      PodLogger.warn(
+        'parser',
+        'Parse anomalies',
+        detail:
+            'syncSkips=$syncSkips, parseErrors=$parseErrors, goodRecords=${logs.length}',
+      );
     }
 
     return logs;
@@ -257,9 +274,10 @@ class BinaryParser {
         final double lat = data.getFloat32(offset + 13, Endian.little);
         final double lon = data.getFloat32(offset + 17, Endian.little);
 
-        // V3.6: Speed is uint16 (km/h × 10), divide by 10 for km/h
-        final double speed =
-            data.getUint16(offset + 21, Endian.little) / 10.0;
+        // V3.6: Speed is uint16 (km/h × 10). Divide by 10 to get km/h.
+        // SensorLog.speed convention is km/h — converted to m/s downstream
+        // in sensor_log_to_gps_points.dart.
+        final double speed = data.getUint16(offset + 21, Endian.little) / 10.0;
 
         // IMU data starts 2 bytes earlier (offset 23 vs 25) due to smaller speed field
         final double ax = data.getFloat32(offset + 23, Endian.little);
@@ -270,24 +288,26 @@ class BinaryParser {
         final double gy = data.getFloat32(offset + 39, Endian.little);
         final double gz = data.getFloat32(offset + 43, Endian.little);
 
-        logs.add(SensorLog(
-          packetId: kernelTick,
-          timestamp: dt,
-          latitude: lat,
-          longitude: lon,
-          speed: speed,
-          accelX: ax,
-          accelY: ay,
-          accelZ: az,
-          gyroX: gx,
-          gyroY: gy,
-          gyroZ: gz,
-          // V3.6 has no filtered accel — use raw accel as fallback so the
-          // trajectory filter's variance calculator can still detect motion.
-          filteredAccelX: ax,
-          filteredAccelY: ay,
-          filteredAccelZ: az,
-        ));
+        logs.add(
+          SensorLog(
+            packetId: kernelTick,
+            timestamp: dt,
+            latitude: lat,
+            longitude: lon,
+            speed: speed,
+            accelX: ax,
+            accelY: ay,
+            accelZ: az,
+            gyroX: gx,
+            gyroY: gy,
+            gyroZ: gz,
+            // V3.6 has no filtered accel — use raw accel as fallback so the
+            // trajectory filter's variance calculator can still detect motion.
+            filteredAccelX: ax,
+            filteredAccelY: ay,
+            filteredAccelZ: az,
+          ),
+        );
 
         offset += stepSize;
       } catch (e) {
@@ -297,7 +317,12 @@ class BinaryParser {
     }
 
     if (syncSkips > 0 || parseErrors > 0) {
-      PodLogger.warn('parser', 'Parse anomalies (v01)', detail: 'syncSkips=$syncSkips, parseErrors=$parseErrors, goodRecords=${logs.length}');
+      PodLogger.warn(
+        'parser',
+        'Parse anomalies (v01)',
+        detail:
+            'syncSkips=$syncSkips, parseErrors=$parseErrors, goodRecords=${logs.length}',
+      );
     }
 
     return logs;

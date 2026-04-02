@@ -1,6 +1,6 @@
 name: metric_athlete_pod_ble
 description: "BLE communication plugin for Metric Athlete GPS pods."
-version: 0.0.5
+version: 0.0.6
 homepage:
 
 environment:

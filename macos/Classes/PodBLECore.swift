@@ -46,6 +46,11 @@ class PodBLECore: NSObject {
     private var actualPacketSize = 0
     private var currentMessageType: UInt8 = 0
 
+    // File list (0x02) reassembly — pod may fragment across multiple BLE notifications
+    private var fileListBuffer = Data()
+    private var fileListExpectedSize = 0
+    private var isFileListReassemblyActive = false
+
     // Download state
     private var isDownloadActive = false
 
@@ -512,6 +517,13 @@ class PodBLECore: NSObject {
         writeCharacteristic = nil
         notifyCharacteristic = nil
         resetDownloadState()
+        resetFileListState()
+    }
+
+    private func resetFileListState() {
+        isFileListReassemblyActive = false
+        fileListBuffer = Data()
+        fileListExpectedSize = 0
     }
 
     private func snapToStandardInterval(_ raw: Int64) -> Int64 {
@@ -683,10 +695,112 @@ extension PodBLECore: CBPeripheralDelegate {
                 self?.processPacket(packetCopy)
             }
         } else {
-            // Not downloading — pass through directly (live telemetry, file list, settings, etc.)
-            DispatchQueue.main.async { [weak self] in
-                self?.delegate?.didReceivePayload(data)
+            // Check for file list (0x02) that may need reassembly
+            let stripped: Data
+            if data.count >= 2 && data[0] == 0xAE {
+                stripped = data.subdata(in: 1..<data.count)
+            } else {
+                stripped = data
+            }
+
+            if stripped.count >= 3 && stripped[0] == 0x02 {
+                processFileListPacket(stripped)
+            } else if isFileListReassemblyActive && stripped.count > 0 && stripped[0] != 0x01 {
+                // Continuation fragment without 0x02 type — append raw data
+                processFileListPacket(stripped)
+            } else {
+                // Not a file list — pass through directly (live telemetry, settings, etc.)
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.didReceivePayload(data)
+                }
             }
         }
+    }
+
+    // MARK: - File List Reassembly
+
+    /// Reassemble fragmented 0x02 (file list) BLE responses.
+    ///
+    /// The pod sends file list data across multiple BLE notifications when the
+    /// list exceeds a single MTU (~244 bytes). Each notification is framed with
+    /// [0xAE, 0x02, payloadLength, ...data]. The payloadLength describes only
+    /// the data in THAT notification, not the total.
+    ///
+    /// We use fileCount × 36 (stride) + 1 (fileCount byte) to know the total
+    /// expected data, then buffer until complete.
+    private func processFileListPacket(_ stripped: Data) {
+        // stripped = data after 0xAE removal, starts with type byte 0x02
+        // Layout: [0x02, payloadLength, fileCount, ...fileEntries]
+        //   or for continuations: [0x02, fragPayloadLength, ...continuationData]
+
+        guard stripped.count >= 3 else { return }
+
+        // Skip type byte (0x02) and per-fragment payloadLength byte
+        let fragmentData = stripped.subdata(in: 2..<stripped.count)
+
+        if !isFileListReassemblyActive {
+            // First fragment — read fileCount to calculate expected total
+            let fileCount = Int(fragmentData[0])
+
+            if fileCount == 0 {
+                // Genuinely 0 files — pass through immediately
+                NSLog("[PodBLE] fileList — 0 files, passing through")
+                let reassembled = buildFileListPayload(fragmentData)
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.didReceivePayload(reassembled)
+                }
+                return
+            }
+
+            // Expected size: fileCount byte (1) + fileCount × 36 (stride)
+            fileListExpectedSize = 1 + fileCount * 36
+            fileListBuffer = Data(capacity: fileListExpectedSize)
+            fileListBuffer.append(fragmentData)
+            isFileListReassemblyActive = true
+
+            NSLog("[PodBLE] fileList — START reassembly: fileCount=%d, expected=%d bytes, got=%d bytes",
+                  fileCount, fileListExpectedSize, fragmentData.count)
+
+            if fileListBuffer.count >= fileListExpectedSize {
+                finishFileListReassembly()
+            }
+        } else {
+            // Continuation fragment — append data
+            fileListBuffer.append(fragmentData)
+
+            NSLog("[PodBLE] fileList — CONTINUATION: +%d bytes, total=%d/%d",
+                  fragmentData.count, fileListBuffer.count, fileListExpectedSize)
+
+            if fileListBuffer.count >= fileListExpectedSize {
+                finishFileListReassembly()
+            }
+        }
+    }
+
+    private func finishFileListReassembly() {
+        NSLog("[PodBLE] fileList — COMPLETE: %d bytes assembled", fileListBuffer.count)
+
+        let reassembled = buildFileListPayload(fileListBuffer)
+        let finalData = reassembled
+
+        isFileListReassemblyActive = false
+        fileListBuffer = Data()
+        fileListExpectedSize = 0
+
+        DispatchQueue.main.async { [weak self] in
+            self?.delegate?.didReceivePayload(finalData)
+        }
+    }
+
+    /// Build the payload that Dart expects: [0xAE, 0x02, totalPayloadLength, ...fileListData]
+    private func buildFileListPayload(_ fileListData: Data) -> Data {
+        var payload = Data()
+        payload.append(0xAE)
+        payload.append(0x02)
+        // payloadLength = total size of fileListData (capped at UInt8.max)
+        let pLen = min(fileListData.count, Int(UInt8.max))
+        payload.append(UInt8(pLen))
+        payload.append(fileListData)
+        return payload
     }
 }

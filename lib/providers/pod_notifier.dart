@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -27,6 +28,11 @@ class PodNotifier extends Notifier<PodState> {
 
   // Serial command queue to prevent overlapping BLE operations (crash-prone on WinRT)
   final _commandQueue = BleCommandQueue();
+
+  // File list (0x02) reassembly — pod may fragment across multiple BLE notifications
+  Uint8List _fileListBuffer = Uint8List(0);
+  int _fileListExpectedSize = 0;
+  bool _fileListReassemblyActive = false;
 
   // Timer to sync UI with Native Scanner timeout
   Timer? _scanTimer;
@@ -328,6 +334,13 @@ class PodNotifier extends Notifier<PodState> {
         return;
       }
 
+      // File list (0x02) reassembly — pod fragments across multiple BLE
+      // notifications when file count exceeds single MTU capacity (~6 files).
+      if (messageData[0] == 0x02 && messageData.length >= 3) {
+        _handleFileListFragment(messageData);
+        return;
+      }
+
       PodLogger.info(
         'protocol',
         'Decoded message',
@@ -338,11 +351,106 @@ class PodNotifier extends Notifier<PodState> {
     });
   }
 
+  /// Handle a file list (0x02) BLE fragment. The pod splits the file list
+  /// across multiple BLE notifications when file count exceeds ~6 files.
+  ///
+  /// Fragment layout after 0xAE strip: [0x02, fragPayloadLength, ...data]
+  /// First fragment data starts with fileCount byte; continuations are raw.
+  void _handleFileListFragment(Uint8List messageData) {
+    // messageData = [0x02, fragPayloadLength, ...fragmentData]
+    final fragmentData = messageData.sublist(
+      2,
+    ); // skip type + fragPayloadLength
+
+    if (!_fileListReassemblyActive) {
+      // First fragment — read fileCount to calculate expected total
+      if (fragmentData.isEmpty) return;
+      final fileCount = fragmentData[0];
+
+      if (fileCount == 0) {
+        // Genuinely 0 files — pass through immediately
+        PodLogger.info(
+          'protocol',
+          'Decoded message',
+          detail: 'type=0x02, payload=${messageData.length - 1} bytes',
+        );
+        _protocolHandler.handleMessage(0x02, messageData.sublist(1));
+        return;
+      }
+
+      // Expected: fileCount byte (1) + fileCount × 36 (stride per file entry)
+      _fileListExpectedSize = 1 + fileCount * 36;
+      final builder = BytesBuilder();
+      builder.add(fragmentData);
+      _fileListBuffer = builder.toBytes();
+      _fileListReassemblyActive = true;
+
+      PodLogger.info(
+        'protocol',
+        'File list reassembly START',
+        detail:
+            'fileCount=$fileCount, expected=$_fileListExpectedSize bytes, got=${fragmentData.length} bytes',
+      );
+
+      if (_fileListBuffer.length >= _fileListExpectedSize) {
+        _finishFileListReassembly();
+      }
+    } else {
+      // Continuation fragment — append data
+      final builder = BytesBuilder();
+      builder.add(_fileListBuffer);
+      builder.add(fragmentData);
+      _fileListBuffer = builder.toBytes();
+
+      PodLogger.info(
+        'protocol',
+        'File list reassembly CONTINUATION',
+        detail:
+            '+${fragmentData.length} bytes, total=${_fileListBuffer.length}/$_fileListExpectedSize',
+      );
+
+      if (_fileListBuffer.length >= _fileListExpectedSize) {
+        _finishFileListReassembly();
+      }
+    }
+  }
+
+  /// Emit the fully reassembled file list to the protocol handler.
+  void _finishFileListReassembly() {
+    PodLogger.info(
+      'protocol',
+      'File list reassembly COMPLETE',
+      detail: '${_fileListBuffer.length} bytes assembled',
+    );
+
+    // Build the payload the protocol handler expects:
+    // [payloadLength(capped), fileCount, ...fileEntries]
+    final pLen = _fileListBuffer.length > 255 ? 255 : _fileListBuffer.length;
+    final builder = BytesBuilder();
+    builder.addByte(pLen); // payloadLength (for logging only)
+    builder.add(_fileListBuffer);
+    final reassembled = builder.toBytes();
+
+    _fileListReassemblyActive = false;
+    _fileListBuffer = Uint8List(0);
+    _fileListExpectedSize = 0;
+
+    PodLogger.info(
+      'protocol',
+      'Decoded message',
+      detail: 'type=0x02, payload=${reassembled.length} bytes (reassembled)',
+    );
+    _protocolHandler.handleMessage(0x02, Uint8List.fromList(reassembled));
+  }
+
   /// Resets the connection state when the Pod disconnects.
   void _resetConnectionState() {
     _hasAutoConnected = false;
     _liveSessionBuffer.clear();
     _commandQueue.clear();
+    _fileListReassemblyActive = false;
+    _fileListBuffer = Uint8List(0);
+    _fileListExpectedSize = 0;
 
     // Fail-safe: Kill any pending download futures so the UI doesn't hang forever
     if (_syncCompleter != null && !_syncCompleter!.isCompleted) {

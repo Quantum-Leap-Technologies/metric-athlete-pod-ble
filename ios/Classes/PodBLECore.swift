@@ -33,6 +33,7 @@ class PodBLECore: NSObject {
     private var notifyCharacteristic: CBCharacteristic?
 
     private let bleQueue = DispatchQueue(label: "com.pod_connector.ble", qos: .userInitiated)
+    private let processingQueue = DispatchQueue(label: "com.pod_connector.processing", qos: .userInitiated)
 
     // Scanning
     private var scanTimer: Timer?
@@ -175,14 +176,18 @@ class PodBLECore: NSObject {
                   let peripheral = self.connectedPeripheral,
                   let characteristic = self.writeCharacteristic else {
                 if data.count > 0 {
-                    NSLog("[PodBLE] writeCommand — DROPPED cmd=0x%02X (%d bytes), no connection/characteristic", data[0], data.count)
+                    NSLog("[PodBLE] writeCommand — DROPPED cmd=0x%02X (%d bytes), no connection/characteristic, notify=%@",
+                          data[0], data.count, self?.notifyCharacteristic != nil ? "YES" : "NO")
                 }
                 return
             }
-            if data.count > 0 {
-                NSLog("[PodBLE] writeCommand — cmd=0x%02X (%d bytes)", data[0], data.count)
-            }
-            peripheral.writeValue(data, for: characteristic, type: .withResponse)
+            // Prepend 0xAE message header per BLE ICD V3.6 protocol spec.
+            // All App-to-POD messages require: [0xAE, message_type, payload_length, ...payload]
+            var packet = Data([0xAE])
+            packet.append(data)
+            let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+            NSLog("[PodBLE] writeCommand — sending [%@] (%d bytes)", hex, packet.count)
+            peripheral.writeValue(packet, for: characteristic, type: .withResponse)
         }
     }
 
@@ -269,27 +274,33 @@ class PodBLECore: NSObject {
             return
         }
 
+        // Strip 0xAE header from pod responses (ICD V3.6)
+        let data: Data
+        if packet.count >= 2 && packet[0] == 0xAE {
+            data = packet.subdata(in: 1..<packet.count)
+        } else {
+            data = packet
+        }
+
         if receivedPacketCount == 0 {
             // First packet (header)
-            guard packet.count >= 9 else {
-                NSLog("[PodBLE] processPacket — DROPPED first packet: too short for header (%d bytes)", packet.count)
+            guard data.count >= 8 else {
+                NSLog("[PodBLE] processPacket — DROPPED first packet: too short for header (%d bytes after 0xAE strip)", data.count)
                 return
             }
 
-            let type = packet[0]
+            let type = data[0]
             currentMessageType = type
 
-            // Read total expected packets (bytes 5-8, little endian)
-            totalExpectedPackets = Int(packet.subdata(in: 5..<9).withUnsafeBytes {
+            // Read total expected packets (bytes 4-7 of stripped data, little endian)
+            totalExpectedPackets = Int(data.subdata(in: 4..<8).withUnsafeBytes {
                 $0.load(as: UInt32.self).littleEndian
             })
 
-            NSLog("[PodBLE] processPacket — HEADER: type=0x%02X, expectedPackets=%d, packetSize=%d",
-                  type, totalExpectedPackets, packet.count)
+            NSLog("[PodBLE] processPacket — HEADER: type=0x%02X, expectedPackets=%d, dataSize=%d",
+                  type, totalExpectedPackets, data.count)
 
             // Sanity check — reject obviously corrupt headers.
-            // A 2-hour session at 10 Hz ≈ 72 000 entries × ~64 bytes ≈ 72 000 packets.
-            // Cap at 500 000 to allow headroom but prevent multi-GB allocations.
             let maxReasonablePackets = 500_000
             guard totalExpectedPackets > 0 && totalExpectedPackets <= maxReasonablePackets else {
                 NSLog("[PodBLE] processPacket — REJECTED: unreasonable packet count %d (max=%d)", totalExpectedPackets, maxReasonablePackets)
@@ -304,22 +315,22 @@ class PodBLECore: NSObject {
 
             payloadBuffer.append(currentMessageType)
 
-            if packet.count > 9 {
-                payloadBuffer.append(packet.subdata(in: 9..<packet.count))
+            if data.count > 8 {
+                payloadBuffer.append(data.subdata(in: 8..<data.count))
             }
             receivedPacketCount = 1
 
         } else {
-            // Subsequent packet
-            if packet.count > 5 {
-                payloadBuffer.append(packet.subdata(in: 5..<packet.count))
+            // Subsequent packet — strip 5-byte BLE framing header
+            if data.count > 4 {
+                payloadBuffer.append(data.subdata(in: 4..<data.count))
             }
             receivedPacketCount += 1
         }
 
         // Auto-detect packet size from first packet
         if actualPacketSize == 0 {
-            actualPacketSize = packet.count
+            actualPacketSize = packet.count // Use raw packet size for MTU detection
         }
 
         // Smart Peek
@@ -672,8 +683,12 @@ extension PodBLECore: CBPeripheralDelegate {
             }
         }
 
-        NSLog("[PodBLE] didDiscoverCharacteristics — total=%d, notify=%@, write=%@",
-              characteristics.count, foundNotify ? "YES" : "NO", foundWrite ? "YES" : "NO")
+        // Log MTU — iOS auto-negotiates during connection, maximumWriteValueLength reflects the result
+        let mtuWithResponse = peripheral.maximumWriteValueLength(for: .withResponse)
+        let mtuWithoutResponse = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        NSLog("[PodBLE] didDiscoverCharacteristics — total=%d, notify=%@, write=%@, MTU(withResp)=%d, MTU(noResp)=%d",
+              characteristics.count, foundNotify ? "YES" : "NO", foundWrite ? "YES" : "NO",
+              mtuWithResponse, mtuWithoutResponse)
 
         if !foundNotify || !foundWrite {
             NSLog("[PodBLE] WARNING — missing characteristics! Available UUIDs: %@",
@@ -686,6 +701,23 @@ extension PodBLECore: CBPeripheralDelegate {
         }
     }
 
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            NSLog("[PodBLE] didWriteValue — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
+        } else {
+            NSLog("[PodBLE] didWriteValue — write confirmed for %@", characteristic.uuid.uuidString)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            NSLog("[PodBLE] didUpdateNotificationState — ERROR: %@ (code=%d)", error.localizedDescription, (error as NSError).code)
+        } else {
+            NSLog("[PodBLE] didUpdateNotificationState — notify=%@ for %@",
+                  characteristic.isNotifying ? "ON" : "OFF", characteristic.uuid.uuidString)
+        }
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             // Notification read failed — device may have disconnected
@@ -695,12 +727,18 @@ extension PodBLECore: CBPeripheralDelegate {
         guard characteristic.uuid == notifyCharUUID,
               let data = characteristic.value, !data.isEmpty else { return }
 
+        let hex = data.prefix(20).map { String(format: "%02X", $0) }.joined(separator: " ")
+        NSLog("[PodBLE] didUpdateValue — received %d bytes: [%@%@]", data.count, hex, data.count > 20 ? "..." : "")
+
         lastPacketTime = Date()
 
         // Route packets: download reassembly vs direct passthrough
         if isDownloadActive || totalExpectedPackets > 0 || receivedPacketCount > 0 {
-            // Active download — route through packet reassembly
-            processPacket(data)
+            // Active download — route through processing queue to avoid blocking BLE thread
+            let packetCopy = Data(data)
+            processingQueue.async { [weak self] in
+                self?.processPacket(packetCopy)
+            }
         } else {
             // Not downloading — pass through directly (live telemetry, file list, settings, etc.)
             DispatchQueue.main.async { [weak self] in

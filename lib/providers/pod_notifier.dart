@@ -303,13 +303,38 @@ class PodNotifier extends Notifier<PodState> {
         PodLogger.warn('ble', 'Empty payload received');
         return;
       }
-      PodLogger.debug(
-        'protocol',
-        'Payload received',
+
+      // Log raw bytes for diagnostics
+      final rawHex = payload
+          .take(20)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join(' ');
+      PodLogger.info(
+        'ble',
+        'Raw payload',
         detail:
-            'type=0x${payload[0].toRadixString(16).padLeft(2, '0')}, size=${payload.length} bytes',
+            '${payload.length} bytes: [$rawHex${payload.length > 20 ? '...' : ''}]',
       );
-      _protocolHandler.handleMessage(payload[0], payload.sublist(1));
+
+      // Per BLE ICD V3.6, pod-to-app messages may start with 0xAE header.
+      // Strip it to get the actual message type and payload.
+      Uint8List messageData = payload;
+      if (payload.length >= 2 && payload[0] == 0xAE) {
+        messageData = payload.sublist(1);
+      }
+
+      if (messageData.isEmpty) {
+        PodLogger.warn('ble', 'Empty payload after header strip');
+        return;
+      }
+
+      PodLogger.info(
+        'protocol',
+        'Decoded message',
+        detail:
+            'type=0x${messageData[0].toRadixString(16).padLeft(2, '0')}, payload=${messageData.length - 1} bytes',
+      );
+      _protocolHandler.handleMessage(messageData[0], messageData.sublist(1));
     });
   }
 
@@ -844,8 +869,16 @@ class PodNotifier extends Notifier<PodState> {
   }
 
   Future<void> getLogFilesInfo() async {
-    PodLogger.info('sync', 'Requesting file list from pod');
+    PodLogger.info(
+      'sync',
+      'Requesting file list from pod',
+      detail:
+          'connected=${state.connectedDeviceId != null}, '
+          'files=${state.podFiles.length}, '
+          'status="${state.statusMessage}"',
+    );
     await _write([0x05, 0x00]);
+    PodLogger.info('sync', 'File list command written to BLE');
   }
 
   Future<void> deleteLogFile(String fileInfo) async {
@@ -884,12 +917,19 @@ class PodNotifier extends Notifier<PodState> {
   }
 
   Future<void> getDeviceSettings() async {
+    PodLogger.info('sync', 'Requesting device settings');
     state = state.copyWith(isLoadingSettings: true);
     await _write([0x09, 0x00]);
+    PodLogger.info('sync', 'Settings command written to BLE');
 
     Future.delayed(const Duration(seconds: 3), () {
-      if (state.isLoadingSettings)
+      if (state.isLoadingSettings) {
+        PodLogger.warn(
+          'sync',
+          'Settings response timeout (3s) — no reply from pod',
+        );
         state = state.copyWith(isLoadingSettings: false);
+      }
     });
   }
 

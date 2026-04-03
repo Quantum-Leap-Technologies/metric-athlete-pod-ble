@@ -10,10 +10,9 @@ import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
 class PodMessage {
   final int type;
   final String description;
-  final dynamic payload; 
+  final dynamic payload;
   PodMessage(this.type, this.description, {this.payload});
 }
-
 
 ///This class is used to decode and process the different message types that is received from the pod through bluetooth.
 ///The class contains requires an instance of the [podMessage] class for communication with the [podNotifier].
@@ -38,20 +37,26 @@ class PodProtocolHandler {
   void handleMessage(int type, Uint8List payload) {
     switch (type) {
       case 0x01: //Live data steaming
-      try {
-        //transforms the payload to a LiveTelemetry object, updates the description and returns the object to the notifier.
-           final telemetry = LiveTelemetry.fromBytes(payload);
-           if (telemetry != null) {
-             onMessageDecoded(PodMessage(
-               0x01,
-               "Live Update",
-               payload: telemetry //live telemetry object
-             ));
-           } else {
-             PodLogger.warn('protocol', 'Truncated telemetry packet', detail: '${payload.length} bytes, need 72');
-           }
+        try {
+          //transforms the payload to a LiveTelemetry object, updates the description and returns the object to the notifier.
+          final telemetry = LiveTelemetry.fromBytes(payload);
+          if (telemetry != null) {
+            onMessageDecoded(
+              PodMessage(
+                0x01,
+                "Live Update",
+                payload: telemetry, //live telemetry object
+              ),
+            );
+          } else {
+            PodLogger.warn(
+              'protocol',
+              'Truncated telemetry packet',
+              detail: '${payload.length} bytes, need 72',
+            );
+          }
         } catch (e) {
-           PodLogger.error('protocol', 'Telemetry parse error', detail: '$e');
+          PodLogger.error('protocol', 'Telemetry parse error', detail: '$e');
         }
         break;
 
@@ -63,37 +68,47 @@ class PodProtocolHandler {
         _handleFileDownload(payload);
         break;
 
-      case 0x05://settings retrieved 
+      case 0x05: //settings retrieved
         _handleSettings(payload);
         break;
 
-      case 0xda://file skipped.
-      //This is a custom message type used to let the notifier know a file was skipped while trying to download multiple files based on a time range.
-      //Is crucial to pass the await call if a file is skipped.
+      case 0xda: //file skipped.
+        //This is a custom message type used to let the notifier know a file was skipped while trying to download multiple files based on a time range.
+        //Is crucial to pass the await call if a file is skipped.
         onMessageDecoded(PodMessage(0xda, "File Skipped"));
-      break;
-      
+        break;
 
       default: //sends the unknown type and description to the pod notifier
         onMessageDecoded(PodMessage(type, "Unknown Message"));
     }
   }
 
-  
   ///Helper function to parse the downloaded bytes into raw [SensorLog] objects.
   ///The payload is in the format described by the [BinaryParser].
   ///Filtering is NOT done here — it is handled by the notifier to avoid double-filtering.
   void _handleFileDownload(Uint8List rawBytes) {
-    PodLogger.info('sync', 'File download payload received', detail: '${rawBytes.length} bytes');
+    PodLogger.info(
+      'sync',
+      'File download payload received',
+      detail: '${rawBytes.length} bytes',
+    );
     try {
       // Parse binary data into raw SensorLog objects
       final rawLogs = BinaryParser.parseBytes(rawBytes);
 
-      PodLogger.info('sync', 'Binary parse complete', detail: '${rawLogs.length} records from ${rawBytes.length} bytes');
+      PodLogger.info(
+        'sync',
+        'Binary parse complete',
+        detail: '${rawLogs.length} records from ${rawBytes.length} bytes',
+      );
 
       if (rawLogs.isEmpty && rawBytes.length > 1) {
-        PodLogger.warn('sync', 'Parse yielded 0 records from non-empty payload',
-            detail: 'first bytes: [${rawBytes.take(16).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+        PodLogger.warn(
+          'sync',
+          'Parse yielded 0 records from non-empty payload',
+          detail:
+              'first bytes: [${rawBytes.take(16).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}]',
+        );
       }
 
       // --- INTEGRITY CHECK ---
@@ -102,16 +117,21 @@ class PodProtocolHandler {
       if (rawLogs.isNotEmpty) {
         final knownSizes = [
           BinaryParser.v01DataSize, // 47 (V3.6)
-          BinaryParser.dataSize,    // 61 (Proewe)
-          BinaryParser.packetSize,  // 64 (HTS)
+          BinaryParser.dataSize, // 61 (Proewe)
+          BinaryParser.packetSize, // 64 (HTS)
         ];
         for (final recordSize in knownSizes) {
           if (rawBytes.length % recordSize == 0) {
             final expectedRecords = rawBytes.length ~/ recordSize;
-            final lossPercent = ((expectedRecords - rawLogs.length) / expectedRecords * 100);
+            final lossPercent =
+                ((expectedRecords - rawLogs.length) / expectedRecords * 100);
             if (lossPercent > 5.0) {
-              PodLogger.warn('sync', 'Possible data loss during transfer',
-                  detail: 'expected ~$expectedRecords records (${recordSize}B each), got ${rawLogs.length} (${lossPercent.toStringAsFixed(1)}% loss)');
+              PodLogger.warn(
+                'sync',
+                'Possible data loss during transfer',
+                detail:
+                    'expected ~$expectedRecords records (${recordSize}B each), got ${rawLogs.length} (${lossPercent.toStringAsFixed(1)}% loss)',
+              );
             }
             break;
           }
@@ -119,15 +139,17 @@ class PodProtocolHandler {
       }
 
       // Return raw List<SensorLog> to Notifier (filtering happens there)
-      onMessageDecoded(PodMessage(
-        0x03,
-        "Download Complete",
-        payload: rawLogs,
-      ));
+      onMessageDecoded(PodMessage(0x03, "Download Complete", payload: rawLogs));
     } catch (e) {
-      PodLogger.error('protocol', 'Binary parse error', detail: '$e, payloadSize=${rawBytes.length}');
+      PodLogger.error(
+        'protocol',
+        'Binary parse error',
+        detail: '$e, payloadSize=${rawBytes.length}',
+      );
       // Send empty list to signal failure
-      onMessageDecoded(PodMessage(0x03, "Parse Failed", payload: <SensorLog>[]));
+      onMessageDecoded(
+        PodMessage(0x03, "Parse Failed", payload: <SensorLog>[]),
+      );
     }
   }
 
@@ -147,22 +169,19 @@ class PodProtocolHandler {
   /// 3. Extracts the [Log Interval] by combining the 2nd and 3rd bytes (Little Endian).
   /// 4. Updates the notifier with a Map containing these settings.
   void _handleSettings(Uint8List data) {
-    // Safety check: Ensure we have enough bytes
-    if (data.length >= 3) {
-      
+    // Per ICD V3.6: data[0] = payload_length, data[1..] = settings data
+    // Settings payload: [player_number(1), log_interval_lsb(1), log_interval_msb(1)]
+    if (data.length >= 4) {
       final settings = {
-        'playerNumber': data[0],
-        
+        'playerNumber': data[1],
+
         // Combine 2 bytes for interval (Little Endian: LSB + MSB << 8)
-        // e.g., if data[1]=100 (0x64) and data[2]=0, result is 100ms.
-        'logInterval': data[1] + (data[2] << 8) 
+        'logInterval': data[2] + (data[3] << 8),
       };
 
-      onMessageDecoded(PodMessage(
-        0x05, 
-        "Settings Retrieved", 
-        payload: settings
-      ));
+      onMessageDecoded(
+        PodMessage(0x05, "Settings Retrieved", payload: settings),
+      );
     }
   }
 
@@ -187,50 +206,88 @@ class PodProtocolHandler {
   /// 4. Updates the notifier with a list of formatted file summaries.
   void _handleLogFilesInfo(Uint8List data) {
     try {
-      if (data.isEmpty) {
-        PodLogger.warn('protocol', 'File list response empty', detail: '0 bytes received');
+      if (data.length < 2) {
+        PodLogger.warn(
+          'protocol',
+          'File list response too short',
+          detail: '${data.length} bytes received',
+        );
         return;
       }
 
-      int fileCount = data[0];
-      PodLogger.info('protocol', 'File list received', detail: 'fileCount=$fileCount, payloadSize=${data.length} bytes');
+      // Per ICD V3.6 section 2.3.2.1.3:
+      // data[0] = payload length byte, data[1] = file count
+      final payloadLength = data[0];
+      int fileCount = data[1];
+      PodLogger.info(
+        'protocol',
+        'File list received',
+        detail:
+            'payloadLength=$payloadLength, fileCount=$fileCount, dataSize=${data.length} bytes',
+      );
 
       List<String> fileSummaries = [];
       int totalUsedBytes = 0;
-      int headerSize = 1;
+      int headerSize = 2; // skip payload_length + file_count
       int stride = 36;
 
       for (int i = 0; i < fileCount; i++) {
         int startOffset = headerSize + (i * stride);
         if (startOffset + stride > data.length) {
-          PodLogger.warn('protocol', 'File list truncated', detail: 'file $i: need offset ${startOffset + stride} but only ${data.length} bytes');
+          PodLogger.warn(
+            'protocol',
+            'File list truncated',
+            detail:
+                'file $i: need offset ${startOffset + stride} but only ${data.length} bytes',
+          );
           break;
         }
 
         List<int> rawName = data.sublist(startOffset, startOffset + 32);
         int nullIndex = rawName.indexOf(0x00);
-        List<int> cleanName = (nullIndex != -1) ? rawName.sublist(0, nullIndex) : rawName;
+        List<int> cleanName =
+            (nullIndex != -1) ? rawName.sublist(0, nullIndex) : rawName;
         String name = ascii.decode(cleanName, allowInvalid: true);
 
         int sizeOffset = startOffset + 32;
-        int size = ByteData.sublistView(data, sizeOffset, sizeOffset + 4).getUint32(0, Endian.little);
+        int size = ByteData.sublistView(
+          data,
+          sizeOffset,
+          sizeOffset + 4,
+        ).getUint32(0, Endian.little);
         totalUsedBytes += size;
 
         final summary = "$name (${(size / 1024).toStringAsFixed(1)} KB)";
-        PodLogger.debug('protocol', 'File[$i]', detail: '$summary (${size} bytes raw)');
+        PodLogger.debug(
+          'protocol',
+          'File[$i]',
+          detail: '$summary (${size} bytes raw)',
+        );
         fileSummaries.add(summary);
       }
 
-      PodLogger.info('protocol', 'Storage used', detail: '${(totalUsedBytes / (1024 * 1024)).toStringAsFixed(1)} MB across $fileCount files');
+      PodLogger.info(
+        'protocol',
+        'Storage used',
+        detail:
+            '${(totalUsedBytes / (1024 * 1024)).toStringAsFixed(1)} MB across $fileCount files',
+      );
 
       if (fileCount == 0) {
-        PodLogger.warn('protocol', 'Pod reports 0 files', detail: 'payload byte[0]=$fileCount');
+        PodLogger.warn(
+          'protocol',
+          'Pod reports 0 files',
+          detail: 'payload byte[0]=$fileCount',
+        );
       }
 
-      onMessageDecoded(PodMessage(0x02, "Found $fileCount Files", payload: {
-        'files': fileSummaries,
-        'storageUsedBytes': totalUsedBytes,
-      }));
+      onMessageDecoded(
+        PodMessage(
+          0x02,
+          "Found $fileCount Files",
+          payload: {'files': fileSummaries, 'storageUsedBytes': totalUsedBytes},
+        ),
+      );
     } catch (e) {
       PodLogger.error('protocol', 'Error decoding file list', detail: '$e');
     }

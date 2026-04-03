@@ -737,7 +737,9 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         synchronized(gattLock) {
             val c = bluetoothGatt?.getService(SERVICE_UUID)?.getCharacteristic(WRITE_CHAR_UUID)
             if (c != null) {
-                c.value = d
+                // Prepend 0xAE message header per BLE ICD V3.6 protocol spec.
+                val packet = byteArrayOf(0xAE.toByte()) + d
+                c.value = packet
                 bluetoothGatt?.writeCharacteristic(c)
             }
         }

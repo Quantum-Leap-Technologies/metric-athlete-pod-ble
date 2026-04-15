@@ -70,6 +70,25 @@ Additional processing:
 - `PodState` — Immutable state for UI: scanning, connection, files, telemetry, recording, settings, clusters, RSSI, clockDrift
 - `SessionBlock` — Clustered session with start/end times, logs, and metadata
 
+## Platform Notes
+
+### macOS debug: TCC Bluetooth crash when launched from a terminal
+
+On macOS 26 (Tahoe) and later, `flutter run -d macos` can crash at launch with `Namespace TCC, Code 0 — must contain NSBluetoothAlwaysUsageDescription key`, even though the Info.plist *does* contain that key.
+
+**Cause:** when Flutter launches the debug binary as a direct child of your terminal (Warp, iTerm, Terminal.app), macOS assigns the terminal as the TCC "responsible process". Because this plugin links `CoreBluetooth`, the TCC check runs against the terminal's Bluetooth permission, not the app's — and the terminal almost never has it, so TCC SIGABRTs the process before Flutter can attach a debugger.
+
+**Fix:** grant your terminal Bluetooth access once in **System Settings → Privacy & Security → Bluetooth**. After that, `flutter run -d macos` works normally.
+
+**Fallback** (if you can't grant terminal access): cold-launch via LaunchServices and attach:
+```bash
+flutter build macos --debug --flavor dev -t lib/main_dev.dart
+open -n "build/macos/Build/Products/Debug-dev/Metric Athlete.app"
+flutter attach -d macos
+```
+
+**Related design choice:** `PodConnectorPlugin.bleCore` is a `lazy var` — `CBCentralManager` is only constructed on the first method call, not during plugin registration. This avoids a TCC check inside `viewWillAppear` (before the window is on screen), which macOS 26 treats as a privacy violation regardless of Info.plist contents. Do not change this back to eager init.
+
 ## Key Conventions
 
 - State management uses Riverpod v3 (`flutter_riverpod: ^3.0.3`) with `Notifier<PodState>` pattern (not code generation)

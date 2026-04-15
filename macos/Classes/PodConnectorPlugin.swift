@@ -5,7 +5,16 @@ import Cocoa
 /// Bridges the PodBLECore to Flutter via MethodChannel and EventChannels.
 public class PodConnectorPlugin: NSObject, FlutterPlugin {
 
-    private var bleCore: PodBLECore!
+    // Lazy — avoids instantiating CBCentralManager during plugin registration, which runs
+    // inside viewWillAppear and triggers a TCC Bluetooth check before the first window is
+    // on screen. On macOS 26+ that check SIGABRTs the app even when the Info.plist keys
+    // are present. Deferring construction to the first method call moves the TCC prompt
+    // onto a user-initiated action, which is what the OS expects.
+    private lazy var bleCore: PodBLECore = {
+        let core = PodBLECore()
+        core.delegate = self
+        return core
+    }()
 
     // Event sinks for streaming data to Flutter
     private var statusSink: FlutterEventSink?
@@ -40,10 +49,6 @@ public class PodConnectorPlugin: NSObject, FlutterPlugin {
             binaryMessenger: registrar.messenger
         )
         payloadChannel.setStreamHandler(PayloadStreamHandler(plugin: instance))
-
-        // Initialize BLE Core
-        instance.bleCore = PodBLECore()
-        instance.bleCore.delegate = instance
     }
 
     // MARK: - Method Call Handler

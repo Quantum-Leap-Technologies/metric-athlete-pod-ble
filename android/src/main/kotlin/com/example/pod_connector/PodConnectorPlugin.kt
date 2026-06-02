@@ -576,7 +576,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                         gatt.setPreferredPhy(
                             BluetoothDevice.PHY_LE_2M_MASK,
                             BluetoothDevice.PHY_LE_2M_MASK,
-                            BluetoothDevice.PHY_NO_PREFERRED
+                            BluetoothDevice.PHY_OPTION_NO_PREFERRED
                         )
                     }, 400)
                 }

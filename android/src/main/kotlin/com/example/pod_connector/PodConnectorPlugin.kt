@@ -234,10 +234,17 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             "requestBatteryExemption" -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     try {
-                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                        intent.data = Uri.parse("package:${context.packageName}")
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(intent)
+                        // Only launch the system settings screen if we are NOT already
+                        // exempt. Launching it unconditionally steals and returns focus,
+                        // which fires the app's lifecycle "resumed" handler and — when a
+                        // scan screen re-scans on resume — drives a runaway startScan loop.
+                        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                        if (!pm.isIgnoringBatteryOptimizations(context.packageName)) {
+                            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                            intent.data = Uri.parse("package:${context.packageName}")
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            context.startActivity(intent)
+                        }
                     } catch (e: Exception) { Log.e(TAG, "Battery exemption failed", e) }
                 }
                 result.success(null)
@@ -576,7 +583,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                         gatt.setPreferredPhy(
                             BluetoothDevice.PHY_LE_2M_MASK,
                             BluetoothDevice.PHY_LE_2M_MASK,
-                            BluetoothDevice.PHY_NO_PREFERRED
+                            BluetoothDevice.PHY_OPTION_NO_PREFERRED
                         )
                     }, 400)
                 }

@@ -91,8 +91,8 @@ flutter attach -d macos
 
 ## Key Conventions
 
-- State management uses Riverpod v3 (`flutter_riverpod: ^3.0.3`) with `Notifier<PodState>` pattern (not code generation)
-- The main Flutter app uses Riverpod v2 (`flutter_riverpod: ^2.5.1`) — do NOT upgrade the main app to v3
+- State management uses Riverpod v3 (`flutter_riverpod: ^3.0.3`) with the `Notifier<PodState>` pattern (no code generation)
+- The main Flutter app is also on Riverpod v3 but uses code generation — keep this plugin codegen-free
 - Heavy computation (`TrajectoryFilter.process`, `FilterPipeline`) must run via `compute()` isolate
 - BLE UUIDs are hardcoded to match STM32 firmware: Service `761993fb-...`, Notify `5e0c4072-...`, Write `fb4a9352-...`
 - All binary data is Little Endian

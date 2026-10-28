@@ -2,6 +2,7 @@ name: metric_athlete_pod_ble
 description: "BLE communication plugin for Metric Athlete GPS pods."
 version: 0.0.10
 homepage:
+publish_to: none # private package: consumed by metric-athlete-app via git, never published to pub.dev
 
 environment:
   sdk: '>=3.7.0 <4.0.0'

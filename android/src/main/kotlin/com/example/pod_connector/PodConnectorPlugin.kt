@@ -444,6 +444,24 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
         // Auto-connect set to 'false' for faster initial connection
         synchronized(gattLock) {
+            // Never leave an earlier connection open. The session screen's pod scan
+            // connects first and the sync connects again; the first BluetoothGatt used to
+            // leak but stay subscribed, and since every connection shares gattCallback each
+            // notification was delivered twice (a 253-byte file list reassembled as 482
+            // bytes, a "796 MB (2489%)" storage readout, endless "0 files" replies).
+            val previous = bluetoothGatt
+            if (previous != null) {
+                Log.w(TAG, "[BLE] connectToDevice: closing the existing GATT connection before reconnecting")
+                bluetoothGatt = null // events from `previous` are now ignored (isCurrentGatt)
+                try {
+                    previous.disconnect()
+                    previous.close()
+                } catch (e: Exception) {
+                    Log.w(TAG, "[BLE] closing the previous GATT connection failed", e)
+                }
+                // Drop anything the old connection had queued, and any half download.
+                resetDownloadState()
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 // Allow both 1M and 2M PHY at connect time; 2M upgrade requested in onConnectionStateChange
                 bluetoothGatt = device?.connectGatt(
@@ -580,8 +598,23 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     // --- GATT CALLBACKS ---
+
+    /**
+     * True only for events from the connection we currently own. A connection we
+     * replaced or closed can still deliver late events (including its "disconnected"
+     * event, which would otherwise tear down the NEW connection via disconnectDevice()).
+     * Taking gattLock here also means an event can never be judged before
+     * connectToDevice() has finished assigning bluetoothGatt.
+     */
+    private fun isCurrentGatt(gatt: BluetoothGatt): Boolean =
+        synchronized(gattLock) { gatt === bluetoothGatt }
+
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (!isCurrentGatt(gatt)) {
+                Log.d(TAG, "[BLE] ignoring connection-state event from a replaced GATT client (state=$newState, status=$status)")
+                return
+            }
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 sendStatus("Connected")
                 // Optimization: Request HIGH priority for fastest connection interval (~7.5ms)
@@ -605,6 +638,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (!isCurrentGatt(gatt)) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "[BLE] MTU negotiated: ${mtu} bytes (payload=${mtu - 3} bytes). DLE should be active if MTU > 27.")
             } else {
@@ -613,6 +647,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         }
 
         override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+            if (!isCurrentGatt(gatt)) return
             val phyName = { phy: Int -> when (phy) {
                 BluetoothDevice.PHY_LE_1M -> "1M"
                 BluetoothDevice.PHY_LE_2M -> "2M"
@@ -627,6 +662,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (!isCurrentGatt(gatt)) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 enableNotifications(gatt)
                 // Clear any leftover buffers on the Pod side
@@ -644,6 +680,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
+            if (!isCurrentGatt(gatt)) return
             enqueueNotification(value.copyOf())
         }
 
@@ -651,6 +688,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         @Suppress("DEPRECATION")
         @Deprecated("Replaced by the three-argument callback on API 33+")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (!isCurrentGatt(gatt)) return
             enqueueNotification(characteristic.value?.copyOf())
         }
 

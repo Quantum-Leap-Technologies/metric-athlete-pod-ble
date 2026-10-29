@@ -88,13 +88,17 @@ class MethodChannelPodConnector extends PodConnectorPlatform {
   /// * [start] / [end]: Epoch timestamps (ms) to filter the file content.
   /// * [totalFiles] / [currentIndex]: Used by the native notification to show a "File 1 of 5" progress bar.
   @override
-  Future<void> downloadFile(String filename, int start, int end, int totalFiles, int currentIndex) async {
+  Future<void> downloadFile(String filename, int start, int end, int totalFiles, int currentIndex, {int? expectedBytes}) async {
     await methodChannel.invokeMethod<void>('downloadFile', {
       'filename': filename,
       'filterStart': start,
       'filterEnd': end,
       'totalFiles': totalFiles,     
       'currentIndex': currentIndex, 
+      // Exact size from the pod's file list. Android needs it: the download
+      // stream has no packet-count header, so this is how it knows when the file
+      // is complete. Other platforms ignore it.
+      if (expectedBytes != null) 'expectedBytes': expectedBytes,
     });
   }
 

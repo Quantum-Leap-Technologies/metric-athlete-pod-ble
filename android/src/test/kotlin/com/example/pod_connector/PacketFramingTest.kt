@@ -2,101 +2,78 @@ package com.example.pod_connector
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 class PacketFramingTest {
-    private fun le(n: Int) = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(n).array()
+    /** One notification as the pod sends it: 0xAE, type, length, payload. */
+    private fun frame(type: Int, payload: ByteArray) =
+        byteArrayOf(0xAE.toByte(), type.toByte(), payload.size.toByte()) + payload
 
-    /** A header packet as the pod sends it: 0xAE, type, 3 bytes, count LE, payload. */
-    private fun headerPacket(type: Int, count: Int, payload: ByteArray = ByteArray(0)) =
-        byteArrayOf(0xAE.toByte(), type.toByte(), 0, 0, 0) + le(count) + payload
-
-    @Test fun stripsTheFrameByte() {
-        val packet = byteArrayOf(0xAE.toByte(), 0x03, 1, 2, 3)
-        assertArrayEquals(byteArrayOf(0x03, 1, 2, 3), PacketFraming.stripFrameByte(packet))
+    @Test fun parsesARealDownloadFrame() {
+        // From the field log: [0xAE][0x03][len=0xF1][241 bytes of records]
+        val records = ByteArray(241) { (it % 251).toByte() }
+        val f = PacketFraming.parseFrame(frame(0x03, records))
+        assertNotNull(f)
+        assertEquals(0x03, f!!.type)
+        assertArrayEquals(records, f.payload)
+        assertEquals(241, f.payload.size)
     }
 
-    @Test fun leavesPacketsWithoutTheFrameByteAlone() {
-        val packet = byteArrayOf(0x03, 1, 2, 3)
-        assertArrayEquals(packet, PacketFraming.stripFrameByte(packet))
+    @Test fun overheadIsThreeBytesAndNoPayloadByteIsDropped() {
+        // Regression: the old code stripped 4 bytes after the frame byte and dropped
+        // one real data byte per packet. The first payload byte must survive.
+        val payload = byteArrayOf(0xEA.toByte(), 0x07, 0x0B, 0x1D) // e.g. year 2026 in a record
+        val f = PacketFraming.parseFrame(frame(0x03, payload))!!
+        assertEquals(0xEA, f.payload[0].toInt() and 0xFF)
+        assertArrayEquals(payload, f.payload)
     }
 
-    @Test fun aLoneFrameByteIsNotStripped() {
-        val packet = byteArrayOf(0xAE.toByte())
-        assertArrayEquals(packet, PacketFraming.stripFrameByte(packet))
+    @Test fun recordBytesAreNeverReadAsAPacketCount() {
+        // 0x07EA0000 = 132775936, one of the bogus "counts" from the field log; here
+        // it is just payload and must come through untouched.
+        val payload = byteArrayOf(0x00, 0x00, 0xEA.toByte(), 0x07, 0x01, 0x02)
+        val f = PacketFraming.parseFrame(frame(0x03, payload))!!
+        assertArrayEquals(payload, f.payload)
     }
 
-    @Test fun readsTheRealPacketCountFromTheHeader() {
-        val header = PacketFraming.stripFrameByte(headerPacket(type = 0x03, count = 10033))
-        assertEquals(0x03, PacketFraming.messageType(header))
-        assertEquals(10033, PacketFraming.expectedPacketCount(header))
-        assertTrue(PacketFraming.isReasonablePacketCount(10033))
+    @Test fun nonFramesAreRejected() {
+        assertNull(PacketFraming.parseFrame(byteArrayOf())) // empty
+        assertNull(PacketFraming.parseFrame(byteArrayOf(0xAE.toByte(), 0x03))) // too short
+        assertNull(PacketFraming.parseFrame(byteArrayOf(0x03, 0x01, 0x01, 0x00))) // no 0xAE
     }
 
-    @Test fun theCountOffsetIsTheSameRawOrStripped() {
-        // The old Android code read the count at raw byte 5; after stripping it is
-        // byte 4. For a REAL header packet both give the same, correct count, so the
-        // frame byte is not what produced the garbage counts seen in the field (those
-        // come from DATA packets being treated as headers). What the old code did get
-        // wrong is the message type: it read raw[0], i.e. 0xAE, instead of the type.
-        val raw = headerPacket(type = 0x03, count = 10033)
-        val rawCount = ByteBuffer.wrap(raw, 5, 4).order(ByteOrder.LITTLE_ENDIAN).int
-        val stripped = PacketFraming.stripFrameByte(raw)
-        assertEquals(10033, rawCount)
-        assertEquals(rawCount, PacketFraming.expectedPacketCount(stripped))
-        assertEquals(0xAE, raw[0].toInt() and 0xFF)            // what the old code called the type
-        assertEquals(0x03, PacketFraming.messageType(stripped)) // the real type
+    @Test fun aLengthLargerThanWhatArrivedYieldsWhatIsThere() {
+        val truncated = byteArrayOf(0xAE.toByte(), 0x03, 100, 1, 2, 3)
+        val f = PacketFraming.parseFrame(truncated)!!
+        assertArrayEquals(byteArrayOf(1, 2, 3), f.payload)
     }
 
-    @Test fun rejectsUnreasonableCounts() {
-        assertFalse(PacketFraming.isReasonablePacketCount(0))
-        assertFalse(PacketFraming.isReasonablePacketCount(-2078134006))
-        assertFalse(PacketFraming.isReasonablePacketCount(132775938))
-        assertTrue(PacketFraming.isReasonablePacketCount(PacketFraming.MAX_EXPECTED_PACKETS))
-        assertFalse(PacketFraming.isReasonablePacketCount(PacketFraming.MAX_EXPECTED_PACKETS + 1))
+    @Test fun trailingBytesBeyondTheLengthAreIgnored() {
+        val padded = byteArrayOf(0xAE.toByte(), 0x03, 2, 9, 8, 7, 7, 7)
+        val f = PacketFraming.parseFrame(padded)!!
+        assertArrayEquals(byteArrayOf(9, 8), f.payload)
     }
 
-    @Test fun headerPayloadAndDataPayloadSkipTheirOverhead() {
-        val body = byteArrayOf(9, 8, 7)
-        val header = PacketFraming.stripFrameByte(headerPacket(0x03, 5, body))
-        assertArrayEquals(body, PacketFraming.headerPayload(header))
-
-        // Data packet: 0xAE, [type + 3 bytes], payload. After stripping, 4 bytes of overhead.
-        val data = PacketFraming.stripFrameByte(byteArrayOf(0xAE.toByte(), 0x03, 0, 0, 0) + body)
-        assertArrayEquals(body, PacketFraming.dataPayload(data))
+    @Test fun otherMessageTypesAreParsedWithTheirType() {
+        val f = PacketFraming.parseFrame(frame(0x09, byteArrayOf(1, 2, 3)))!!
+        assertEquals(0x09, f.type)
     }
 
-    @Test fun reassemblesAWholeDownload() {
-        val total = 4
-        val payloads = List(total) { i -> ByteArray(6) { (i * 10 + it).toByte() } }
-        val packets = payloads.mapIndexed { i, p ->
-            if (i == 0) headerPacket(0x03, total, p)
-            else byteArrayOf(0xAE.toByte(), 0x03, 0, 0, 0) + p
-        }
+    @Test fun reassemblingAWholeFileGivesBackEveryByte() {
+        // A 1,000-byte file split into 241-byte frames: concatenating the payloads in
+        // order must reproduce the file exactly, whichever way records fall across frames.
+        val file = ByteArray(1000) { (it * 7 % 256).toByte() }
+        val frames = file.toList().chunked(241).map { frame(0x03, it.toByteArray()) }
         val out = java.io.ByteArrayOutputStream()
-        var count = 0
-        var expected = 0
-        for (packet in packets) {
-            val data = PacketFraming.stripFrameByte(packet)
-            if (count == 0) {
-                expected = PacketFraming.expectedPacketCount(data)
-                out.write(PacketFraming.messageType(data))
-                out.write(PacketFraming.headerPayload(data))
-            } else {
-                out.write(PacketFraming.dataPayload(data))
-            }
-            count++
+        var received = 0L
+        for (packet in frames) {
+            val f = PacketFraming.parseFrame(packet)!!
+            out.write(f.payload)
+            received += f.payload.size
         }
-        assertEquals(total, expected)
-        assertEquals(total, count)
-        // 1 type byte + the header packet's 6 payload bytes + 3 data packets x 6 bytes.
-        assertEquals(1 + 6 + 3 * 6, out.size())
-        // And the bytes are the original payloads, in order.
-        val expectedBytes = byteArrayOf(0x03) + payloads.reduce { a, b -> a + b }
-        assertArrayEquals(expectedBytes, out.toByteArray())
+        assertEquals(1000L, received)
+        assertArrayEquals(file, out.toByteArray())
     }
 }

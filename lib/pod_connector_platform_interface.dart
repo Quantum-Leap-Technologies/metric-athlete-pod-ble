@@ -82,7 +82,7 @@ abstract class PodConnectorPlatform extends PlatformInterface {
   /// * [filename]: The exact name of the file on the Pod (e.g., "20250725.bin").
   /// * [start] / [end]: Epoch timestamps (ms) to filter the data. If 0, downloads the whole file.
   /// * [totalFiles] / [currentIndex]: Used for updating the native notification progress bar (e.g., "Downloading file 1 of 5").
-  Future<void> downloadFile(String filename, int start, int end, int totalFiles, int currentIndex) {
+  Future<void> downloadFile(String filename, int start, int end, int totalFiles, int currentIndex, {int? expectedBytes}) {
     throw UnimplementedError('downloadFile() has not been implemented.');
   }
 

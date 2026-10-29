@@ -59,6 +59,10 @@ class PodNotifier extends Notifier<PodState> {
   // This allows the UI to 'await' a file download even though the data comes in asynchronously via streams.
   Completer<List<SensorLog>>? _syncCompleter;
 
+  /// Exact byte size of each file on the pod, from the last file list. Passed to
+  /// the native download so Android knows when a file is complete.
+  final Map<String, int> _fileSizes = {};
+
   /// Raw (pre-Kalman) sensor logs from the most recent download.
   ///
   /// Available after [downloadLogFile] completes. Use these for haversine
@@ -150,6 +154,9 @@ class PodNotifier extends Notifier<PodState> {
           final payload = msg.payload as Map;
           final files = (payload['files'] as List<String>?) ?? [];
           final usedBytes = (payload['storageUsedBytes'] as int?) ?? 0;
+          _fileSizes
+            ..clear()
+            ..addAll((payload['fileSizes'] as Map?)?.cast<String, int>() ?? const {});
           PodLogger.info(
             'sync',
             'File list updated',
@@ -915,6 +922,7 @@ class PodNotifier extends Notifier<PodState> {
           endMillis,
           totalFiles,
           currentIndex,
+          expectedBytes: _fileSizes[fileInfo.split('(')[0].trim()],
         );
         final stopwatch = Stopwatch()..start();
         final result = await _syncCompleter!.future.timeout(

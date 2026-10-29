@@ -227,6 +227,7 @@ class PodProtocolHandler {
       );
 
       List<String> fileSummaries = [];
+      final fileSizes = <String, int>{}; // exact bytes by file name
       int totalUsedBytes = 0;
       int headerSize = 2; // skip payload_length + file_count
       int stride = 36;
@@ -256,6 +257,7 @@ class PodProtocolHandler {
           sizeOffset + 4,
         ).getUint32(0, Endian.little);
         totalUsedBytes += size;
+        fileSizes[name] = size;
 
         final summary = "$name (${(size / 1024).toStringAsFixed(1)} KB)";
         PodLogger.debug(
@@ -285,7 +287,11 @@ class PodProtocolHandler {
         PodMessage(
           0x02,
           "Found $fileCount Files",
-          payload: {'files': fileSummaries, 'storageUsedBytes': totalUsedBytes},
+          payload: {
+            'files': fileSummaries,
+            'fileSizes': fileSizes,
+            'storageUsedBytes': totalUsedBytes,
+          },
         ),
       );
     } catch (e) {

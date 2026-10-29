@@ -100,7 +100,11 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     
     // --- PACKET REASSEMBLY STATE ---
     @Volatile private var receivedPacketCount = 0
-    @Volatile private var totalExpectedPackets = 0
+    // The download stream has no packet-count header (see PacketFraming). The expected
+    // size is the exact byte size from the pod's file list, passed in by Flutter;
+    // 0 means unknown. receivedBytes counts payload bytes (frame overhead excluded).
+    @Volatile private var expectedBytes = 0L
+    @Volatile private var receivedBytes = 0L
     private var actualPacketSize = 0 // Auto-detected from first packet (usually ~240 bytes for MTU 512)
     private var currentMessageType = 0
     
@@ -135,23 +139,21 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val now = System.currentTimeMillis()
             val timeSinceLastPacket = now - lastPacketTime
 
-            // Case 1: Hard Timeout (No data for 60s)
-            if (totalExpectedPackets > 0 && timeSinceLastPacket > WATCHDOG_TIMEOUT_MS) {
-                Log.w(TAG, "Watchdog: Timeout. Force closing download.")
-                finishMessage()
+            // Case 1: no data for 60s during a download. The link is dead, and what we
+            // have is a partial file: discard it and report a failure. It must NEVER be
+            // delivered to Flutter as if it were a finished file.
+            if (isDownloadActive && timeSinceLastPacket > WATCHDOG_TIMEOUT_MS) {
+                Log.w(TAG, "Watchdog: no data for ${WATCHDOG_TIMEOUT_MS / 1000}s at $receivedBytes/$expectedBytes bytes. Discarding the partial download.")
+                failDownload("Download timed out")
                 return
             }
 
-            // Case 2: The "99% Stuck" Bug
-            // Only check after receiving at least 1 packet to avoid false positives.
-            // Increased threshold to 5s for slow BLE connections near completion.
-            if (receivedPacketCount > 0 && totalExpectedPackets > 0 && timeSinceLastPacket > 5000) {
-                val progress = (receivedPacketCount.toDouble() / totalExpectedPackets.toDouble())
-                if (progress > 0.98) {
-                    Log.w(TAG, "Watchdog: Stuck at ${(progress * 100).toInt()}%. Finishing.")
-                    finishMessage()
-                    return
-                }
+            // Case 2: the file size is unknown (no entry in the file list), so we cannot
+            // tell when it is complete: treat a quiet gap after data as the end.
+            if (isDownloadActive && expectedBytes == 0L && receivedPacketCount > 0 && timeSinceLastPacket > 5000) {
+                Log.w(TAG, "Watchdog: size unknown, no data for 5s after $receivedBytes bytes. Finishing.")
+                finishMessage()
+                return
             }
             watchdogHandler.postDelayed(this, 1000)
         }
@@ -226,7 +228,8 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                 val end = call.argument<Number>("filterEnd")?.toLong() ?: 0L
                 totalFilesInPack = call.argument<Int>("totalFiles") ?: 1
                 currentFileIndex = call.argument<Int>("currentIndex") ?: 1
-                startDownloadWithGatekeeper(filename, start, end)
+                val expected = call.argument<Number>("expectedBytes")?.toLong() ?: 0L
+                startDownloadWithGatekeeper(filename, start, end, expected)
                 result.success(null)
             }
             "cancelDownload" -> { abortDownload(); result.success(null) }
@@ -271,8 +274,9 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
                     // 1. Route: only reassemble during active downloads,
                     //    otherwise pass raw packet directly to Flutter
-                    if (isDownloadActive || totalExpectedPackets > 0 || receivedPacketCount > 0) {
-                        processPacket(packet)
+                    val frame = PacketFraming.parseFrame(packet)
+                    if (isDownloadActive && frame != null && frame.type == PacketFraming.TYPE_FILE_DATA) {
+                        processPacket(frame)
                     } else {
                         Log.d(TAG, "[ROUTE] Non-download packet (${packet.size}B, type=0x${if (packet.isNotEmpty()) String.format("%02X", packet[0]) else "??"}) → Flutter")
                         mainHandler.post { payloadSink?.success(packet) }
@@ -290,11 +294,11 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                     updateProgressUI()
                     
                     // 4. Completion Check
-                    // Finish as soon as the declared packet count has arrived. This must
+                    // Finish as soon as the file's declared size has arrived. This must
                     // not wait for the queue to be empty: the pod keeps sending while we
                     // process, so the queue never drained and the download only ended
                     // when the 5s watchdog fired.
-                    if (totalExpectedPackets > 0 && receivedPacketCount >= totalExpectedPackets) {
+                    if (expectedBytes > 0 && receivedBytes >= expectedBytes) {
                         finishMessage()
                         // Anything still queued belongs to a finished download; do not
                         // forward it to Flutter as individual "non-download" packets.
@@ -331,66 +335,33 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     // --- PACKET REASSEMBLY LOGIC ---
-    // The STM32 sends data in chunks (Packets).
-    // Packet 0: [Type][Seq][...][TotalPackets][...Header...] (9 bytes overhead)
-    // Packet N: [Type][Seq][...Header...] (5 bytes overhead)
-    // We must strip these headers to rebuild the clean binary file.
-    private fun processPacket(packet: ByteArray) {
-        if (packet.size < 5) return
-
-        // Every pod packet starts with the 0xAE frame byte (ICD V3.6). Strip it
-        // before parsing so the header offsets match iOS/macOS (db457d0).
-        val data = PacketFraming.stripFrameByte(packet)
-
+    // Each notification is [0xAE][type][length][payload] (see PacketFraming). For a
+    // file download (type 0x03) the payloads are consecutive raw records; we append them
+    // in order and the download is complete when expectedBytes have arrived. There is no
+    // header packet. Anything that is not a file-data frame never reaches this function.
+    private fun processPacket(frame: PacketFraming.Frame) {
         if (receivedPacketCount == 0) {
-            // --- HEADER PACKET (First one) ---
-            if (data.size < PacketFraming.HEADER_OVERHEAD) return
-
-            val type = PacketFraming.messageType(data)
-            currentMessageType = type
-
-            // Read Total Packets
-            totalExpectedPackets = PacketFraming.expectedPacketCount(data)
-            Log.d(TAG, "[PACKET] Header: type=0x${String.format("%02X", type)}, totalExpected=$totalExpectedPackets, packetSize=${packet.size}")
-
-            // Guard against corrupted headers (see PacketFraming.MAX_EXPECTED_PACKETS)
-            if (!PacketFraming.isReasonablePacketCount(totalExpectedPackets)) {
-                Log.e(TAG, "Invalid totalExpectedPackets: $totalExpectedPackets — aborting download")
-                totalExpectedPackets = 0
-                return
+            currentMessageType = frame.type
+            // Allocate the whole file up front when the size is known.
+            val estimated = if (expectedBytes > 0) {
+                (expectedBytes + 2048).coerceAtMost((Int.MAX_VALUE / 2).toLong()).toInt()
+            } else {
+                1 shl 20
             }
-
-            // --- OPTIMIZATION: DYNAMIC MEMORY ALLOCATION ---
-            // Use the 'actualPacketSize' variable (already captured in the thread loop).
-            // This ensures we respect the dynamic MTU (e.g. 64 vs 247).
-            // actualPacketSize is the RAW packet size, which includes the 0xAE byte, so
-            // "- 5" is the full per-packet overhead (0xAE + 4 header bytes).
-
-            // Safety: Ensure we don't calculate negative numbers if packet is tiny
-            val safePacketSize = if (actualPacketSize > 5) actualPacketSize else 64
-
-            // Formula: Total Packets * (Payload Size) + Safety Buffer
-            val estimatedSize = (totalExpectedPackets * (safePacketSize - 5)) + 2048
-
             try {
-                // Allocate the exact size needed immediately
-                payloadBuffer = ByteArrayOutputStream(estimatedSize)
+                payloadBuffer = ByteArrayOutputStream(estimated)
             } catch (e: OutOfMemoryError) {
                 // Fallback for extremely large files
                 Log.e(TAG, "OOM allocating buffer. Falling back to default growth.", e)
                 payloadBuffer = ByteArrayOutputStream()
             }
-            // -----------------------------------------------
-
+            // The Dart side dispatches on the first byte: the message type.
             payloadBuffer.write(currentMessageType)
-            payloadBuffer.write(PacketFraming.headerPayload(data))
-            receivedPacketCount = 1
-
-        } else {
-            // --- PAYLOAD PACKET ---
-            payloadBuffer.write(PacketFraming.dataPayload(data))
-            receivedPacketCount++
+            Log.d(TAG, "[PACKET] First data frame: type=0x${String.format("%02X", frame.type)}, payload=${frame.payload.size}B, expectedBytes=$expectedBytes")
         }
+        payloadBuffer.write(frame.payload)
+        receivedBytes += frame.payload.size
+        receivedPacketCount++
     }
 
     /**
@@ -447,8 +418,9 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             val t1 = ByteBuffer.wrap(peekData, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
             val t2 = ByteBuffer.wrap(peekData, recordSize, 4).order(ByteOrder.LITTLE_ENDIAN).int
             val interval = snapToStandardInterval((t2 - t1).toLong())
-            val ppp = (actualPacketSize - 5).toLong()
-            val dur = ((totalExpectedPackets * ppp) / recordSize) * interval
+            // Without the file size we cannot estimate the duration, so do not filter.
+            if (expectedBytes <= 0L) return
+            val dur = (expectedBytes / recordSize) * interval
 
             // Filter Logic
             if ((filterEnd > 0 && startTime > filterEnd) || (filterStart > 0 && (startTime + dur) < filterStart)) {
@@ -487,6 +459,10 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     private fun disconnectDevice() {
+        // A disconnect ends any download: reset the download state and drop the
+        // buffer. Without this the watchdog fired 60s later and delivered the partial
+        // file (e.g. 0.2 MB of 16 MB) to Flutter as a finished one.
+        resetDownloadState()
         // Send Stop signal to Service (release WakeLock)
         val serviceIntent = Intent(context, PodForegroundService::class.java)
         serviceIntent.action = "STOP"
@@ -503,13 +479,14 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     // --- DOWNLOAD FLOW ---
-    private fun startDownloadWithGatekeeper(filename: String, start: Long, end: Long) {
+    private fun startDownloadWithGatekeeper(filename: String, start: Long, end: Long, expected: Long) {
         stopWatchdog()
         // Reset State
         isDownloadActive = true
         packetQueue.clear()
         receivedPacketCount = 0
-        totalExpectedPackets = 0
+        receivedBytes = 0L
+        expectedBytes = expected
         actualPacketSize = 0 
         lastPercent = -1
         isSmartPeekDone = false 
@@ -547,14 +524,42 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         isDownloadActive = false
 
         // FLUSH DATA TO FLUTTER HERE
-        val finalBytes = payloadBuffer.toByteArray()
-        Log.d(TAG, "[FINISH] Download complete: type=0x${String.format("%02X", currentMessageType)}, ${finalBytes.size}B, $receivedPacketCount packets")
+        var finalBytes = payloadBuffer.toByteArray()
+        // 1 type byte + payload. Never deliver more than the file holds.
+        if (expectedBytes > 0 && finalBytes.size - 1 > expectedBytes) {
+            finalBytes = finalBytes.copyOf((expectedBytes + 1).toInt())
+        }
+        Log.d(TAG, "[FINISH] Download complete: type=0x${String.format("%02X", currentMessageType)}, ${finalBytes.size}B (expected ${if (expectedBytes > 0) expectedBytes else -1}), $receivedPacketCount packets")
         mainHandler.post { payloadSink?.success(finalBytes) }
 
         // Cleanup for next file
         receivedPacketCount = 0
-        totalExpectedPackets = 0
+        receivedBytes = 0L
+        expectedBytes = 0L
         payloadBuffer.reset()
+    }
+
+    /** Throws away any download in progress: nothing partial is ever delivered. */
+    private fun resetDownloadState() {
+        stopWatchdog()
+        isDownloadActive = false
+        packetQueue.clear()
+        receivedPacketCount = 0
+        receivedBytes = 0L
+        expectedBytes = 0L
+        payloadBuffer.reset()
+        isSmartPeekDone = false
+    }
+
+    /**
+     * The download cannot finish (the link went quiet). Discard the partial file and
+     * tell Flutter the connection is gone, so the sync fails and retries instead of
+     * parsing half a file as a finished one.
+     */
+    private fun failDownload(reason: String) {
+        resetDownloadState()
+        sendStatus("Disconnected: $reason")
+        disconnectDevice()
     }
 
     private fun abortDownload(reason: String = "User Cancelled") {
@@ -565,7 +570,8 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         
         packetQueue.clear()
         receivedPacketCount = 0
-        totalExpectedPackets = 0
+        receivedBytes = 0L
+        expectedBytes = 0L
         payloadBuffer.reset()
         isSmartPeekDone = false
         
@@ -661,11 +667,11 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     private fun updateProgressUI() {
         val now = System.currentTimeMillis()
         // Throttle updates to max 2 per second to save UI thread
-        if (now - lastUiUpdateTime < 500 && receivedPacketCount < totalExpectedPackets) return
+        if (now - lastUiUpdateTime < 500 && receivedBytes < expectedBytes) return
         lastUiUpdateTime = now
         
-        if (totalExpectedPackets > 0) {
-            val filePercent = minOf(100, (receivedPacketCount * 100) / totalExpectedPackets)
+        if (expectedBytes > 0) {
+            val filePercent = minOf(100L, (receivedBytes * 100) / expectedBytes).toInt()
             val overallPercent = calculateOverallPercent(filePercent)
             
             if (overallPercent != lastPercent) {

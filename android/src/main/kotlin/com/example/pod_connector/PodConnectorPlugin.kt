@@ -628,8 +628,27 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             }
         }
 
+        // Android 13+ (API 33) delivers the notification bytes WITH the callback. Use
+        // that: reading characteristic.value in the old callback reads a buffer shared
+        // by every notification, so a packet arriving right behind another can
+        // overwrite it before we copy it. A lost/duplicated header packet then makes
+        // every following data packet be parsed as a header (garbage packet counts).
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+        ) {
+            enqueueNotification(value.copyOf())
+        }
+
+        // Android 12 and older only call this one.
+        @Suppress("DEPRECATION")
+        @Deprecated("Replaced by the three-argument callback on API 33+")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            val rawPacket = characteristic.value?.copyOf()
+            enqueueNotification(characteristic.value?.copyOf())
+        }
+
+        private fun enqueueNotification(rawPacket: ByteArray?) {
             if (rawPacket != null && rawPacket.isNotEmpty()) {
                 lastPacketTime = System.currentTimeMillis()
                 // Fast handoff to processing thread

@@ -67,6 +67,14 @@ void main() {
     expect(args['filterEnd'], 2000);
     expect(args['totalFiles'], 5);
     expect(args['currentIndex'], 1);
+    // Not sent unless known, so other platforms see exactly what they used to.
+    expect(args.containsKey('expectedBytes'), isFalse);
+  });
+
+  test('downloadFile sends the exact file size when it is known', () async {
+    await platform.downloadFile('20260606.bin', 0, 0, 1, 1, expectedBytes: 16471040);
+    final args = methodCalls.first.arguments as Map;
+    expect(args['expectedBytes'], 16471040);
   });
 
   test('cancelDownload invokes native method', () async {

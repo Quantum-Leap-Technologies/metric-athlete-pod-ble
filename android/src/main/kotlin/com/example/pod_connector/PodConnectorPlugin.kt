@@ -290,9 +290,15 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                     updateProgressUI()
                     
                     // 4. Completion Check
+                    // Finish as soon as the declared packet count has arrived. This must
+                    // not wait for the queue to be empty: the pod keeps sending while we
+                    // process, so the queue never drained and the download only ended
+                    // when the 5s watchdog fired.
                     if (totalExpectedPackets > 0 && receivedPacketCount >= totalExpectedPackets) {
-                        Thread.sleep(50) // Small grace period for any stragglers
-                        if (packetQueue.isEmpty()) finishMessage()
+                        finishMessage()
+                        // Anything still queued belongs to a finished download; do not
+                        // forward it to Flutter as individual "non-download" packets.
+                        packetQueue.clear()
                     }
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
@@ -330,22 +336,25 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     // Packet N: [Type][Seq][...Header...] (5 bytes overhead)
     // We must strip these headers to rebuild the clean binary file.
     private fun processPacket(packet: ByteArray) {
-        if (packet.size < 5) return 
+        if (packet.size < 5) return
+
+        // Every pod packet starts with the 0xAE frame byte (ICD V3.6). Strip it
+        // before parsing so the header offsets match iOS/macOS (db457d0).
+        val data = PacketFraming.stripFrameByte(packet)
 
         if (receivedPacketCount == 0) {
             // --- HEADER PACKET (First one) ---
-            if (packet.size < 9) return
-            
-            val type = packet[0].toInt() and 0xFF
+            if (data.size < PacketFraming.HEADER_OVERHEAD) return
+
+            val type = PacketFraming.messageType(data)
             currentMessageType = type
 
             // Read Total Packets
-            totalExpectedPackets = ByteBuffer.wrap(packet, 5, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            totalExpectedPackets = PacketFraming.expectedPacketCount(data)
             Log.d(TAG, "[PACKET] Header: type=0x${String.format("%02X", type)}, totalExpected=$totalExpectedPackets, packetSize=${packet.size}")
 
-            // Guard against corrupted headers: cap at 500,000 packets (~32MB at 64B/packet)
-            val MAX_EXPECTED_PACKETS = 500_000
-            if (totalExpectedPackets <= 0 || totalExpectedPackets > MAX_EXPECTED_PACKETS) {
+            // Guard against corrupted headers (see PacketFraming.MAX_EXPECTED_PACKETS)
+            if (!PacketFraming.isReasonablePacketCount(totalExpectedPackets)) {
                 Log.e(TAG, "Invalid totalExpectedPackets: $totalExpectedPackets — aborting download")
                 totalExpectedPackets = 0
                 return
@@ -354,14 +363,15 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             // --- OPTIMIZATION: DYNAMIC MEMORY ALLOCATION ---
             // Use the 'actualPacketSize' variable (already captured in the thread loop).
             // This ensures we respect the dynamic MTU (e.g. 64 vs 247).
-            
+            // actualPacketSize is the RAW packet size, which includes the 0xAE byte, so
+            // "- 5" is the full per-packet overhead (0xAE + 4 header bytes).
+
             // Safety: Ensure we don't calculate negative numbers if packet is tiny
             val safePacketSize = if (actualPacketSize > 5) actualPacketSize else 64
-            
+
             // Formula: Total Packets * (Payload Size) + Safety Buffer
-            // Payload Size = Packet Size - 5 bytes (Type + Seq overhead)
             val estimatedSize = (totalExpectedPackets * (safePacketSize - 5)) + 2048
-            
+
             try {
                 // Allocate the exact size needed immediately
                 payloadBuffer = ByteArrayOutputStream(estimatedSize)
@@ -372,18 +382,13 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
             }
             // -----------------------------------------------
 
-            payloadBuffer.write(currentMessageType) 
-            
-            if (packet.size > 9) {
-                payloadBuffer.write(packet, 9, packet.size - 9)
-            }
+            payloadBuffer.write(currentMessageType)
+            payloadBuffer.write(PacketFraming.headerPayload(data))
             receivedPacketCount = 1
-            
+
         } else {
             // --- PAYLOAD PACKET ---
-            if (packet.size > 5) {
-                payloadBuffer.write(packet, 5, packet.size - 5)
-            }
+            payloadBuffer.write(PacketFraming.dataPayload(data))
             receivedPacketCount++
         }
     }
@@ -641,7 +646,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         lastUiUpdateTime = now
         
         if (totalExpectedPackets > 0) {
-            val filePercent = (receivedPacketCount * 100) / totalExpectedPackets
+            val filePercent = minOf(100, (receivedPacketCount * 100) / totalExpectedPackets)
             val overallPercent = calculateOverallPercent(filePercent)
             
             if (overallPercent != lastPercent) {

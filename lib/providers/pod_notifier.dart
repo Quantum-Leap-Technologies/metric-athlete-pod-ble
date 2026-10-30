@@ -619,6 +619,12 @@ class PodNotifier extends Notifier<PodState> {
   /// Connects to a specific Pod device by its ID.
   Future<void> connect(String id) async {
     await stopScan();
+    // Already connected to this pod: reconnecting would close the working GATT
+    // connection and open a new one, which can fail to finish service setup.
+    if (state.connectedDeviceId == id) {
+      PodLogger.info('ble', 'connect() skipped — already connected', detail: id);
+      return;
+    }
     state = state.copyWith(isScanning: false, statusMessage: "Connecting...");
     try {
       await _native.connect(id);

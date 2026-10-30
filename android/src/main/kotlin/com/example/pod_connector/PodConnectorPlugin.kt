@@ -432,7 +432,16 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
     }
 
     // --- CONNECTION LOGIC ---
-    private fun connectToDevice(address: String) {
+
+    // A first connection attempt that fails before the link is up (typically
+    // Android's generic status 133) is worth retrying: one retry often clears it.
+    private val maxConnectRetries = 2
+    private var connectRetries = 0
+    @Volatile private var gattReachedConnected = false
+
+    private fun connectToDevice(address: String, isRetry: Boolean = false) {
+        if (!isRetry) connectRetries = 0
+        gattReachedConnected = false
         stopScanning()
         // Start Foreground Service immediately to ensure we have a WakeLock
         val serviceIntent = Intent(context, PodForegroundService::class.java)
@@ -638,6 +647,8 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                 return
             }
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                gattReachedConnected = true
+                connectRetries = 0
                 sendStatus("Connected")
                 // Optimization: Request HIGH priority for fastest connection interval (~7.5ms)
                 // This also triggers Data Length Extension (DLE) negotiation on Android 8+
@@ -655,6 +666,31 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                 }
                 mainHandler.postDelayed({ gatt.discoverServices() }, 600)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                // The link never came up (status 133 and friends): retry rather than
+                // giving up, and say why if we do give up. Previously the status
+                // code was dropped and only "Disconnected" was reported.
+                val neverConnected = !gattReachedConnected
+                val failed = status != BluetoothGatt.GATT_SUCCESS
+                if (neverConnected && failed && connectRetries < maxConnectRetries) {
+                    connectRetries++
+                    val address = gatt.device?.address
+                    Log.w(TAG, "[BLE] connection attempt failed with status $status before connecting; retry $connectRetries of $maxConnectRetries")
+                    synchronized(gattLock) {
+                        // Ignore any late events from the failed client.
+                        if (bluetoothGatt === gatt) bluetoothGatt = null
+                    }
+                    try { gatt.close() } catch (e: Exception) {
+                        Log.w(TAG, "[BLE] closing the failed GATT client failed", e)
+                    }
+                    if (address != null) {
+                        mainHandler.postDelayed({ connectToDevice(address, isRetry = true) }, 1000)
+                        return
+                    }
+                }
+                if (neverConnected && failed) {
+                    Log.e(TAG, "[BLE] connection failed with status $status")
+                    sendStatus("Disconnected: connection failed (Android status $status)")
+                }
                 disconnectDevice()
             }
         }

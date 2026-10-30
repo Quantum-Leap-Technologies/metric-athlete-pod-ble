@@ -269,9 +269,28 @@ class PodNotifier extends Notifier<PodState> {
     }
   }
 
+  // Completed by the native "Connected" status (or failed by a disconnect while
+  // connecting) so connect() reports the real outcome of the connection.
+  Completer<void>? _connectWaiter;
+
   /// Sets up listeners for the native platform streams.
   void _setupNativeListeners() {
     _statusSub = _native.statusStream.listen((status) {
+      final waiter = _connectWaiter;
+      if (waiter != null && !waiter.isCompleted) {
+        if (status == 'Connected') {
+          waiter.complete();
+        } else if (status == 'Disconnected' ||
+            status.startsWith('Disconnected:') ||
+            status == 'Connection Lost') {
+          waiter.completeError(
+            status.startsWith('Disconnected: ')
+                ? status.substring('Disconnected: '.length)
+                : 'the pod disconnected',
+          );
+        }
+      }
+
       // Log all native status messages for diagnostics
       if (status.startsWith('Downloading')) {
         // Don't spam logs with progress updates — only log milestones
@@ -655,18 +674,29 @@ class PodNotifier extends Notifier<PodState> {
 
   Future<void> _connectOnce(String id) async {
     state = state.copyWith(isScanning: false, statusMessage: "Connecting...");
+    final waiter = Completer<void>();
+    _connectWaiter = waiter;
     try {
       await _native.connect(id);
+      // The native call returns as soon as the connection is started. Wait for
+      // the link to actually come up (native retries a failed first attempt
+      // itself): marking the pod connected and sending settings before that
+      // made a failed connection look like a pod that did not reply.
+      await waiter.future.timeout(const Duration(seconds: 60));
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('last_pod_id', id);
       state = state.copyWith(connectedDeviceId: id);
 
       // Wait for connection stability before asking for data
       await Future.delayed(const Duration(seconds: 1));
-      getDeviceSettings();
+      // Only if the link is still up.
+      if (state.connectedDeviceId == id) getDeviceSettings();
     } catch (e) {
+      PodLogger.error('ble', 'Connect failed', detail: '$id: $e');
       state = state.copyWith(statusMessage: "Connect Error: $e");
       _hasAutoConnected = false;
+    } finally {
+      if (identical(_connectWaiter, waiter)) _connectWaiter = null;
     }
   }
 
@@ -1068,12 +1098,20 @@ class PodNotifier extends Notifier<PodState> {
   }
 
   Future<void> getDeviceSettings() async {
+    // Never ask a pod that is not connected: the request went nowhere, then the
+    // 3 s timeout made it look like a pod that was not replying. (METRICAT-55)
+    if (state.connectedDeviceId == null) {
+      PodLogger.warn('sync', 'Settings request skipped — not connected');
+      return;
+    }
     PodLogger.info('sync', 'Requesting device settings');
     state = state.copyWith(isLoadingSettings: true);
     await _write([0x09, 0x00]);
     PodLogger.info('sync', 'Settings command written to BLE');
 
     Future.delayed(const Duration(seconds: 3), () {
+      // The provider may have been disposed in the meantime.
+      if (!ref.mounted) return;
       if (state.isLoadingSettings) {
         PodLogger.warn(
           'sync',

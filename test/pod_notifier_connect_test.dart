@@ -16,6 +16,10 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       nativeCalls.add(call.method);
+      // A native connect takes a moment (GATT connect + service discovery).
+      if (call.method == 'connect') {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      }
       return null;
     });
   });
@@ -53,5 +57,23 @@ void main() {
     expect(nativeCalls.where((m) => m == 'connect'), hasLength(2));
     expect(container.read(podNotifierProvider).connectedDeviceId,
         '11:22:33:44:55:66');
+  });
+
+  test('a second connect() to a pod that is still connecting joins it', () async {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(podNotifierProvider.notifier);
+
+    // The scan's auto-connect and the user's pick, 50 ms apart, before the
+    // first native connect has returned (so connectedDeviceId is still null).
+    final first = notifier.connect('AA:BB:CC:DD:EE:FF');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(container.read(podNotifierProvider).connectedDeviceId, isNull);
+    final second = notifier.connect('AA:BB:CC:DD:EE:FF');
+    await Future.wait([first, second]);
+
+    expect(nativeCalls.where((m) => m == 'connect'), hasLength(1));
+    expect(container.read(podNotifierProvider).connectedDeviceId,
+        'AA:BB:CC:DD:EE:FF');
   });
 }

@@ -444,6 +444,16 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
         // Auto-connect set to 'false' for faster initial connection
         synchronized(gattLock) {
+            // Already connecting or connected to this pod: leave that connection
+            // alone. bluetoothGatt is cleared on every disconnect, so a non-null
+            // one is live or being set up; closing it mid-setup and reconnecting
+            // left discoverServices() never completing (no notifications, the
+            // file list repeating every 3 s). (METRICAT-55)
+            val existing = bluetoothGatt
+            if (existing != null && existing.device?.address.equals(address, ignoreCase = true)) {
+                Log.i(TAG, "[BLE] connectToDevice: already connecting/connected to $address, keeping the existing connection")
+                return
+            }
             // Never leave an earlier connection open. The session screen's pod scan
             // connects first and the sync connects again; the first BluetoothGatt used to
             // leak but stay subscribed, and since every connection shares gattCallback each
@@ -462,16 +472,28 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                 // Drop anything the old connection had queued, and any half download.
                 resetDownloadState()
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                // Allow both 1M and 2M PHY at connect time; 2M upgrade requested in onConnectionStateChange
-                bluetoothGatt = device?.connectGatt(
-                    context, false, gattCallback, BluetoothDevice.TRANSPORT_LE,
-                    BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK, bluetoothHandler
-                )
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                bluetoothGatt = device?.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            val openGatt = {
+                synchronized(gattLock) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        // Allow both 1M and 2M PHY at connect time; 2M upgrade requested in onConnectionStateChange
+                        bluetoothGatt = device?.connectGatt(
+                            context, false, gattCallback, BluetoothDevice.TRANSPORT_LE,
+                            BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK, bluetoothHandler
+                        )
+                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        bluetoothGatt = device?.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                    } else {
+                        bluetoothGatt = device?.connectGatt(context, false, gattCallback)
+                    }
+                }
+            }
+            if (previous != null) {
+                // Give the stack a moment to finish closing the old connection
+                // before opening another; reconnecting immediately could leave the
+                // new one without service discovery.
+                mainHandler.postDelayed({ openGatt() }, 300)
             } else {
-                bluetoothGatt = device?.connectGatt(context, false, gattCallback)
+                openGatt()
             }
         }
     }

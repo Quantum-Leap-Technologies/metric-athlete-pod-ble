@@ -616,6 +616,14 @@ class PodNotifier extends Notifier<PodState> {
     state = state.copyWith(isScanning: false);
   }
 
+  // A connect that has started but not finished. connectedDeviceId is only set
+  // once the native connect returns, so without this a second connect() to the
+  // same pod (the user picking it while the scan's auto-connect is still
+  // setting up) closed the half-open connection and started another, which
+  // could fail to finish service discovery.
+  Future<void>? _connectInFlight;
+  String? _connectInFlightId;
+
   /// Connects to a specific Pod device by its ID.
   Future<void> connect(String id) async {
     await stopScan();
@@ -625,6 +633,27 @@ class PodNotifier extends Notifier<PodState> {
       PodLogger.info('ble', 'connect() skipped — already connected', detail: id);
       return;
     }
+    // Already connecting to this pod: wait for that attempt instead of
+    // starting a second one.
+    final inFlight = _connectInFlight;
+    if (inFlight != null && _connectInFlightId == id) {
+      PodLogger.info('ble', 'connect() joined — already connecting', detail: id);
+      return inFlight;
+    }
+    final attempt = _connectOnce(id);
+    _connectInFlight = attempt;
+    _connectInFlightId = id;
+    try {
+      await attempt;
+    } finally {
+      if (identical(_connectInFlight, attempt)) {
+        _connectInFlight = null;
+        _connectInFlightId = null;
+      }
+    }
+  }
+
+  Future<void> _connectOnce(String id) async {
     state = state.copyWith(isScanning: false, statusMessage: "Connecting...");
     try {
       await _native.connect(id);

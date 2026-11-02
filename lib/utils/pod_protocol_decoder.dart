@@ -6,12 +6,14 @@ import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
 ///The [type] contains the message type received from the pod.
 ///The [description] describes the current state or content of the message.
 ///The [payload] contains the data received in the message from the pod.
+///The [payloadBytes] is the size of the raw bytes a file download (0x03) was parsed from, so the notifier can check it against the file's expected size.
 ///The [podNotifier] uses the [type],[description] and [payload] data type to determine what models and states to update.
 class PodMessage {
   final int type;
   final String description;
   final dynamic payload;
-  PodMessage(this.type, this.description, {this.payload});
+  final int? payloadBytes;
+  PodMessage(this.type, this.description, {this.payload, this.payloadBytes});
 }
 
 ///This class is used to decode and process the different message types that is received from the pod through bluetooth.
@@ -139,7 +141,14 @@ class PodProtocolHandler {
       }
 
       // Return raw List<SensorLog> to Notifier (filtering happens there)
-      onMessageDecoded(PodMessage(0x03, "Download Complete", payload: rawLogs));
+      onMessageDecoded(
+        PodMessage(
+          0x03,
+          "Download Complete",
+          payload: rawLogs,
+          payloadBytes: rawBytes.length,
+        ),
+      );
     } catch (e) {
       PodLogger.error(
         'protocol',
@@ -148,7 +157,12 @@ class PodProtocolHandler {
       );
       // Send empty list to signal failure
       onMessageDecoded(
-        PodMessage(0x03, "Parse Failed", payload: <SensorLog>[]),
+        PodMessage(
+          0x03,
+          "Parse Failed",
+          payload: <SensorLog>[],
+          payloadBytes: rawBytes.length,
+        ),
       );
     }
   }

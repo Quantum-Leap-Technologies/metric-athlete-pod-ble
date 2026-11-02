@@ -1,3 +1,12 @@
+## 0.0.17
+
+### Fixed
+* **Android: a download that loses its framing now fails (METRICAT-92):** while a download is running, a packet that is not a frame is no longer forwarded to Flutter, where its first byte was read as a message type (0x03 as a finished file, 0x02 as a file list). The plugin logs the first bad packet (bytes received, bytes expected, first bytes), sends cancel (0x08) and discards the partial file.
+* **Android watchdog:** only file-data frames count as progress, so a pod that keeps sending unframed bytes still times out.
+* **Download result checks:** a finished file whose size differs from the size in the file list, or that parses to 0 records, now fails the download (`downloadLogFile` throws) instead of returning `[]`. Only a skip (0xDA) returns `[]`.
+* **File list during a download:** 0x02 messages are ignored while a download is in flight, so `podFiles` and the expected file sizes cannot be replaced by file bytes.
+* **Stray file data:** a 0x03 message with no download in flight is ignored.
+
 ## 1.1.0
 
 ### Fixed

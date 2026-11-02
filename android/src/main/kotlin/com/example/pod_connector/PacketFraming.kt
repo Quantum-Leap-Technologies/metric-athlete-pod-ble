@@ -39,4 +39,27 @@ internal object PacketFraming {
         val count = if (length < available) length else available
         return Frame(type, packet.copyOfRange(FRAME_OVERHEAD, FRAME_OVERHEAD + count))
     }
+
+    /** Where one notification goes. */
+    enum class Route {
+        /** A file-data frame of the download in progress. */
+        DOWNLOAD_DATA,
+
+        /** Anything else (status, file list, ...) is for Flutter's decoder. */
+        TO_FLUTTER,
+
+        /**
+         * No frame while a download is running: the stream lost its framing and
+         * these are not file bytes we can place. Never forward them to Flutter,
+         * where the first byte would be read as a message type (0x03 = a finished
+         * file, 0x02 = a file list). Cancel and fail the download instead.
+         */
+        FAIL_DOWNLOAD,
+    }
+
+    fun route(downloadActive: Boolean, frame: Frame?): Route = when {
+        downloadActive && frame == null -> Route.FAIL_DOWNLOAD
+        downloadActive && frame!!.type == TYPE_FILE_DATA -> Route.DOWNLOAD_DATA
+        else -> Route.TO_FLUTTER
+    }
 }

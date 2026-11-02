@@ -59,6 +59,24 @@ class PodNotifier extends Notifier<PodState> {
   // This allows the UI to 'await' a file download even though the data comes in asynchronously via streams.
   Completer<List<SensorLog>>? _syncCompleter;
 
+  /// Exact size of the file being downloaded, from the file list (null when the
+  /// size is unknown). A finished download of a different size is a failure.
+  int? _downloadExpectedBytes;
+
+  /// True from the start of a download attempt until it completes or fails.
+  bool get _downloadInFlight =>
+      _syncCompleter != null && !_syncCompleter!.isCompleted;
+
+  /// Fails the download in flight. Only a real finish or a real skip (0xDA) may
+  /// complete it; an empty, short or corrupt result must never look like success.
+  void _failDownload(String reason) {
+    PodLogger.error('sync', 'Download failed', detail: reason);
+    state = state.copyWith(statusMessage: 'Download failed: $reason');
+    if (_downloadInFlight) {
+      _syncCompleter!.completeError(StateError(reason));
+    }
+  }
+
   /// Exact byte size of each file on the pod, from the last file list. Passed to
   /// the native download so Android knows when a file is complete.
   final Map<String, int> _fileSizes = {};
@@ -175,8 +193,25 @@ class PodNotifier extends Notifier<PodState> {
       case 0x03:
         if (msg.payload is List<SensorLog>) {
           final rawLogs = msg.payload as List<SensorLog>;
+          final expected = _downloadExpectedBytes;
+          final received = msg.payloadBytes;
 
-          if (rawLogs.isNotEmpty) {
+          if (!_downloadInFlight) {
+            // Nothing is waiting for a file: a stray 0x03 (e.g. raw file bytes
+            // after the download failed) must not be taken as a finished file.
+            PodLogger.warn(
+              'sync',
+              'Ignored file data with no download in flight',
+              detail: '${msg.payloadBytes ?? 0} bytes',
+            );
+          } else if (expected != null &&
+              expected > 0 &&
+              received != null &&
+              received != expected) {
+            _failDownload(
+              'Received $received bytes but the file holds $expected',
+            );
+          } else if (rawLogs.isNotEmpty) {
             // Store raw (pre-Kalman) logs for distance calculation.
             // Raw GPS positions give ~10% more accurate haversine distance.
             lastRawLogs = List.unmodifiable(rawLogs);
@@ -231,11 +266,9 @@ class PodNotifier extends Notifier<PodState> {
               'Downloaded file is empty/corrupt',
               detail: 'rawLogs.isEmpty after parse',
             );
-            state = state.copyWith(statusMessage: "Data Corrupt or Empty");
-            // Signal failure to the download function
-            if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-              _syncCompleter!.complete([]);
-            }
+            // An empty result is a failed download, not a skipped file: only
+            // 0xDA completes with [].
+            _failDownload('Data corrupt or empty');
           }
         }
         break;
@@ -363,6 +396,16 @@ class PodNotifier extends Notifier<PodState> {
       // File list (0x02) reassembly — pod fragments across multiple BLE
       // notifications when file count exceeds single MTU capacity (~6 files).
       if (messageData[0] == 0x02 && messageData.length >= 3) {
+        // File bytes that happen to start with 0x02 must not replace the file
+        // list (podFiles, _fileSizes) while a download is running.
+        if (_downloadInFlight) {
+          PodLogger.warn(
+            'sync',
+            'Ignored file list during a download',
+            detail: '${messageData.length} bytes',
+          );
+          return;
+        }
         _handleFileListFragment(messageData);
         return;
       }
@@ -972,6 +1015,7 @@ class PodNotifier extends Notifier<PodState> {
       }
 
       _syncCompleter = Completer<List<SensorLog>>();
+      _downloadExpectedBytes = _fileSizes[fileInfo.split('(')[0].trim()];
       state = state.copyWith(
         downloadedFileBytes: null,
         statusMessage:
@@ -987,7 +1031,7 @@ class PodNotifier extends Notifier<PodState> {
           endMillis,
           totalFiles,
           currentIndex,
-          expectedBytes: _fileSizes[fileInfo.split('(')[0].trim()],
+          expectedBytes: _downloadExpectedBytes,
         );
         final stopwatch = Stopwatch()..start();
         final result = await _syncCompleter!.future.timeout(

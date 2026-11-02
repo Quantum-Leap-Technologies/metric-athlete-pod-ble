@@ -275,12 +275,25 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
                     // 1. Route: only reassemble during active downloads,
                     //    otherwise pass raw packet directly to Flutter
                     val frame = PacketFraming.parseFrame(packet)
-                    if (isDownloadActive && frame != null && frame.type == PacketFraming.TYPE_FILE_DATA) {
-                        processPacket(frame)
-                    } else {
-                        Log.d(TAG, "[ROUTE] Non-download packet (${packet.size}B, type=0x${if (packet.isNotEmpty()) String.format("%02X", packet[0]) else "??"}) → Flutter")
-                        mainHandler.post { payloadSink?.success(packet) }
-                        continue
+                    when (PacketFraming.route(isDownloadActive, frame)) {
+                        PacketFraming.Route.DOWNLOAD_DATA -> {
+                            // Only file data counts as progress for the watchdog; a
+                            // pod that keeps sending unframed bytes must still time out.
+                            lastPacketTime = System.currentTimeMillis()
+                            processPacket(frame!!)
+                        }
+                        PacketFraming.Route.FAIL_DOWNLOAD -> {
+                            val head = packet.take(8).joinToString(" ") { String.format("%02X", it) }
+                            Log.e(TAG, "[ROUTE] Unframed packet during download (${packet.size}B) at $receivedBytes/$expectedBytes bytes, $receivedPacketCount packets, first bytes: $head. Cancelling.")
+                            writeData(byteArrayOf(0x08)) // Cancel: the pod keeps sending otherwise
+                            failDownload("Download lost framing")
+                            continue
+                        }
+                        PacketFraming.Route.TO_FLUTTER -> {
+                            Log.d(TAG, "[ROUTE] Non-download packet (${packet.size}B, type=0x${if (packet.isNotEmpty()) String.format("%02X", packet[0]) else "??"}) → Flutter")
+                            mainHandler.post { payloadSink?.success(packet) }
+                            continue
+                        }
                     }
 
                     // 2. Smart Peek Logic
@@ -752,8 +765,8 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
         private fun enqueueNotification(rawPacket: ByteArray?) {
             if (rawPacket != null && rawPacket.isNotEmpty()) {
-                lastPacketTime = System.currentTimeMillis()
-                // Fast handoff to processing thread
+                // Fast handoff to processing thread. The watchdog is fed from the
+                // processing thread, by file-data frames only.
                 packetQueue.offer(rawPacket)
             }
         }

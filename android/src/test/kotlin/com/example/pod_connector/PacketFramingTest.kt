@@ -76,4 +76,38 @@ class PacketFramingTest {
         assertEquals(1000L, received)
         assertArrayEquals(file, out.toByteArray())
     }
+
+    // --- Routing during a download (METRICAT-92) ---
+
+    @Test fun unframedPacketDuringADownloadFailsIt() {
+        // From the field log: raw file bytes "3b 35 f0 df ..." and "60 97 3c 65 ...".
+        // They must never reach Flutter, which would read 0x3b/0x60 as a message type.
+        val raw = byteArrayOf(0x3b, 0x35, 0xf0.toByte(), 0xdf.toByte(), 0x01, 0x02)
+        assertNull(PacketFraming.parseFrame(raw))
+        assertEquals(PacketFraming.Route.FAIL_DOWNLOAD, PacketFraming.route(true, PacketFraming.parseFrame(raw)))
+    }
+
+    @Test fun unframedPacketStartingWith0x02Or0x03IsNotForwardedDuringADownload() {
+        // 0x03 would be read as a whole finished file, 0x02 as a file list.
+        for (first in intArrayOf(0x02, 0x03)) {
+            val raw = ByteArray(244) { if (it == 0) first.toByte() else (it % 200).toByte() }
+            assertEquals(PacketFraming.Route.FAIL_DOWNLOAD, PacketFraming.route(true, PacketFraming.parseFrame(raw)))
+        }
+    }
+
+    @Test fun fileDataFramesDuringADownloadAreReassembled() {
+        val f = PacketFraming.parseFrame(frame(0x03, ByteArray(241)))
+        assertEquals(PacketFraming.Route.DOWNLOAD_DATA, PacketFraming.route(true, f))
+    }
+
+    @Test fun otherFramedMessagesDuringADownloadStillGoToFlutter() {
+        val f = PacketFraming.parseFrame(frame(0x09, byteArrayOf(1, 2, 3)))
+        assertEquals(PacketFraming.Route.TO_FLUTTER, PacketFraming.route(true, f))
+    }
+
+    @Test fun whenNoDownloadIsActiveEverythingGoesToFlutter() {
+        val raw = byteArrayOf(0x3b, 0x35, 0xf0.toByte(), 0xdf.toByte())
+        assertEquals(PacketFraming.Route.TO_FLUTTER, PacketFraming.route(false, PacketFraming.parseFrame(raw)))
+        assertEquals(PacketFraming.Route.TO_FLUTTER, PacketFraming.route(false, PacketFraming.parseFrame(frame(0x03, ByteArray(10)))))
+    }
 }

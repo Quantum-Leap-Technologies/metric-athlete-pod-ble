@@ -60,6 +60,9 @@ class PodBLECore: NSObject {
     private var isDownloadActive = false
     /// When the current download command was sent; drives the first-packet timeout.
     private var downloadRequestedAt: Date?
+    /// Bumped on every download request. cancelDownload() only sends its delayed
+    /// skip signal if no newer download has started in the meantime.
+    private var downloadGeneration = 0
 
     // Smart Peek filtering
     private var filterStart: Int64 = 0
@@ -227,6 +230,7 @@ class PodBLECore: NSObject {
         let cleanName = filename.components(separatedBy: "(").first?.trimmingCharacters(in: .whitespaces) ?? filename
 
         isDownloadActive = true
+        downloadGeneration += 1
 
         NSLog("[PodBLE] downloadFile — file='%@' (%d/%d), filter=%@, range=[%lld..%lld]",
               cleanName, currentIndex, totalFiles,
@@ -280,9 +284,18 @@ class PodBLECore: NSObject {
 
         resetDownloadState()
 
-        // Send skip signal (0xDA) to Flutter
+        // Send skip signal (0xDA) to Flutter — but only if no new download has
+        // started since. The app's retry cancels, waits 0.5s and requests
+        // again, so a late 0xDA landed on the NEW attempt and completed it
+        // with 0 records ("Failed to download data from any pod file").
+        let generation = downloadGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.delegate?.didReceivePayload(Data([0xDA]))
+            guard let self = self else { return }
+            guard self.downloadGeneration == generation else {
+                NSLog("[PodBLE] cancelDownload — skip signal dropped, a new download started")
+                return
+            }
+            self.delegate?.didReceivePayload(Data([0xDA]))
         }
     }
 

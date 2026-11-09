@@ -146,10 +146,9 @@ class PodNotifier extends Notifier<PodState> {
           // Append to end (O(1) amortized) and take last 200
           final history = List<LiveTelemetry>.from(state.telemetryHistory);
           history.add(newData);
-          final trimmed =
-              history.length > 200
-                  ? history.sublist(history.length - 200)
-                  : history;
+          final trimmed = history.length > 200
+              ? history.sublist(history.length - 200)
+              : history;
 
           //Record to buffer if the user has started a recording session
           if (state.isRecording) {
@@ -159,8 +158,9 @@ class PodNotifier extends Notifier<PodState> {
           state = state.copyWith(
             latestTelemetry: newData,
             telemetryHistory: trimmed,
-            statusMessage:
-                state.isRecording ? "Recording..." : state.statusMessage,
+            statusMessage: state.isRecording
+                ? "Recording..."
+                : state.statusMessage,
             clockDriftMs: driftMs ?? state.clockDriftMs,
           );
         }
@@ -174,7 +174,9 @@ class PodNotifier extends Notifier<PodState> {
           final usedBytes = (payload['storageUsedBytes'] as int?) ?? 0;
           _fileSizes
             ..clear()
-            ..addAll((payload['fileSizes'] as Map?)?.cast<String, int>() ?? const {});
+            ..addAll(
+              (payload['fileSizes'] as Map?)?.cast<String, int>() ?? const {},
+            );
           PodLogger.info(
             'sync',
             'File list updated',
@@ -344,6 +346,13 @@ class PodNotifier extends Notifier<PodState> {
           status == 'Permissions Error') {
         _scanTimer?.cancel();
         state = state.copyWith(statusMessage: status, isScanning: false);
+        return;
+      }
+      // Native gave up on this download attempt (e.g. no file header within
+      // the first-packet timeout). Fail it so the retry loop resends the
+      // request instead of waiting out the 45-minute timeout (METRICAT-115).
+      if (status.startsWith('Download Failed:')) {
+        _failDownload(status.substring('Download Failed:'.length).trim());
         return;
       }
       // Connection errors from native hardening — treat as disconnect
@@ -587,10 +596,9 @@ class PodNotifier extends Notifier<PodState> {
     await requestBatteryExemption();
 
     // 3. Preserve currently connected device (Prevent UI flicker)
-    final connectedDevices =
-        state.scannedDevices
-            .where((device) => device['id'] == state.connectedDeviceId)
-            .toList();
+    final connectedDevices = state.scannedDevices
+        .where((device) => device['id'] == state.connectedDeviceId)
+        .toList();
 
     state = state.copyWith(
       isScanning: true,
@@ -692,14 +700,22 @@ class PodNotifier extends Notifier<PodState> {
     // Already connected to this pod: reconnecting would close the working GATT
     // connection and open a new one, which can fail to finish service setup.
     if (state.connectedDeviceId == id) {
-      PodLogger.info('ble', 'connect() skipped — already connected', detail: id);
+      PodLogger.info(
+        'ble',
+        'connect() skipped — already connected',
+        detail: id,
+      );
       return;
     }
     // Already connecting to this pod: wait for that attempt instead of
     // starting a second one.
     final inFlight = _connectInFlight;
     if (inFlight != null && _connectInFlightId == id) {
-      PodLogger.info('ble', 'connect() joined — already connecting', detail: id);
+      PodLogger.info(
+        'ble',
+        'connect() joined — already connecting',
+        detail: id,
+      );
       return inFlight;
     }
     final attempt = _connectOnce(id);
@@ -903,10 +919,9 @@ class PodNotifier extends Notifier<PodState> {
         "${startTime.year}${startTime.month.toString().padLeft(2, '0')}${startTime.day.toString().padLeft(2, '0')}_${startTime.hour.toString().padLeft(2, '0')}${startTime.minute.toString().padLeft(2, '0')}";
 
     // Naming: Player_X_YYYYMMDD_HHMM_Raw.csv
-    String pNum =
-        state.settingsPlayerNumber > 0
-            ? "Player_${state.settingsPlayerNumber}"
-            : "Player_Unknown";
+    String pNum = state.settingsPlayerNumber > 0
+        ? "Player_${state.settingsPlayerNumber}"
+        : "Player_Unknown";
     String finalName = "${pNum}_${formattedTime}_Raw.csv";
 
     // --- 4. SAVE RAW ARCHIVE ---
@@ -1018,10 +1033,9 @@ class PodNotifier extends Notifier<PodState> {
       _downloadExpectedBytes = _fileSizes[fileInfo.split('(')[0].trim()];
       state = state.copyWith(
         downloadedFileBytes: null,
-        statusMessage:
-            attempt > 0
-                ? "Retrying ($attempt/$maxRetries)..."
-                : "Requesting Data...",
+        statusMessage: attempt > 0
+            ? "Retrying ($attempt/$maxRetries)..."
+            : "Requesting Data...",
       );
 
       try {

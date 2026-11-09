@@ -22,6 +22,11 @@ class PodBLECore: NSObject {
     private let watchdogTimeoutSeconds: TimeInterval = 60
     private let stuckThresholdSeconds: TimeInterval = 5.0
     private let stuckProgressThreshold: Double = 0.98
+    /// How long to wait after a download request for the file header before
+    /// failing the attempt. The watchdog above only arms once a header has been
+    /// accepted, so without this a pod that never answers left the app on
+    /// "Requesting Data..." until the Dart-side 45-minute timeout (METRICAT-115).
+    private let firstPacketTimeoutSeconds: TimeInterval = 15
 
     // MARK: - Properties
 
@@ -53,6 +58,8 @@ class PodBLECore: NSObject {
 
     // Download state
     private var isDownloadActive = false
+    /// When the current download command was sent; drives the first-packet timeout.
+    private var downloadRequestedAt: Date?
 
     // Smart Peek filtering
     private var filterStart: Int64 = 0
@@ -183,6 +190,13 @@ class PodBLECore: NSObject {
                 if data.count > 0 {
                     NSLog("[PodBLE] writeCommand — DROPPED cmd=0x%02X (%d bytes), no connection/characteristic, notify=%@",
                           data[0], data.count, self?.notifyCharacteristic != nil ? "YES" : "NO")
+                    // A dropped download request used to leave the app waiting
+                    // with nothing on the way. There is no usable connection, so
+                    // report it as one — the app fails the sync and resets.
+                    if data[0] == 0x06 {
+                        self?.abortDownload(reason: "download request not sent, no connection")
+                        self?.delegate?.didUpdateStatus("Connection Lost")
+                    }
                 }
                 return
             }
@@ -234,6 +248,7 @@ class PodBLECore: NSObject {
 
         // Arm watchdog
         lastPacketTime = Date()
+        downloadRequestedAt = Date()
         startWatchdog()
 
         // Start keepalive pings to prevent supervision timeout
@@ -486,6 +501,21 @@ class PodBLECore: NSObject {
     private func watchdogTick() {
         let elapsed = Date().timeIntervalSince(lastPacketTime)
 
+        // No file header accepted yet: either the pod never answered, or every
+        // first packet was rejected as a header. Fail the attempt so the app's
+        // retry loop can resend the request.
+        if isDownloadActive && totalExpectedPackets == 0,
+           let requestedAt = downloadRequestedAt {
+            let waited = Date().timeIntervalSince(requestedAt)
+            if waited > firstPacketTimeoutSeconds {
+                NSLog("[PodBLE] watchdog — NO HEADER %.1fs after request (packets seen since: %@), failing attempt",
+                      waited, lastPacketTime > requestedAt ? "YES" : "NO")
+                abortDownload(reason: "no header after \(Int(waited))s")
+                delegate?.didUpdateStatus("Download Failed: No response from pod")
+                return
+            }
+        }
+
         // Hard timeout
         if totalExpectedPackets > 0 && elapsed > watchdogTimeoutSeconds {
             NSLog("[PodBLE] watchdog — HARD TIMEOUT after %.1fs, received=%d/%d packets", elapsed, receivedPacketCount, totalExpectedPackets)
@@ -536,8 +566,20 @@ class PodBLECore: NSObject {
 
     // MARK: - Helpers
 
+    /// Stops the current download attempt without delivering a payload, so the
+    /// app can fail it and retry. Doesn't message the pod: the app's retry calls
+    /// cancelDownload(), which sends the stop command (0x08) before resending.
+    private func abortDownload(reason: String) {
+        NSLog("[PodBLE] abortDownload — %@, received=%d/%d packets", reason, receivedPacketCount, totalExpectedPackets)
+        stopWatchdog()
+        stopKeepalive()
+        endBackgroundDownload()
+        resetDownloadState()
+    }
+
     private func resetDownloadState() {
         isDownloadActive = false
+        downloadRequestedAt = nil
         receivedPacketCount = 0
         totalExpectedPackets = 0
         actualPacketSize = 0

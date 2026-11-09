@@ -116,6 +116,9 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
 
     // --- DOWNLOAD STATE ---
     @Volatile private var isDownloadActive = false
+    // Bumped on every download request. abortDownload() only sends its delayed
+    // skip signal if no newer download has started in the meantime.
+    @Volatile private var downloadGeneration = 0
 
     // --- SMART PEEK FILTERING ---
     private var filterStart: Long = 0
@@ -545,6 +548,7 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         stopWatchdog()
         // Reset State
         isDownloadActive = true
+        downloadGeneration++
         packetQueue.clear()
         receivedPacketCount = 0
         receivedBytes = 0L
@@ -637,8 +641,18 @@ class PodConnectorPlugin: FlutterPlugin, MethodCallHandler {
         payloadBuffer.reset()
         isSmartPeekDone = false
         
-        // Send "Skipped" signal (0xDA) to Flutter so it moves to next file
-        mainHandler.postDelayed({ payloadSink?.success(byteArrayOf(0xDA.toByte())) }, 600)
+        // Send "Skipped" signal (0xDA) to Flutter so it moves to next file — but
+        // only if no new download has started since. The app's retry cancels,
+        // waits 0.5s and requests again, so a late 0xDA landed on the NEW
+        // attempt and completed it with 0 records.
+        val generation = downloadGeneration
+        mainHandler.postDelayed({
+            if (downloadGeneration == generation) {
+                payloadSink?.success(byteArrayOf(0xDA.toByte()))
+            } else {
+                Log.d(TAG, "abortDownload — skip signal dropped, a new download started")
+            }
+        }, 600)
     }
 
     // --- GATT CALLBACKS ---

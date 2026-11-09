@@ -88,8 +88,11 @@ public class PodConnectorPlugin: NSObject, FlutterPlugin {
             let end = (args["filterEnd"] as? NSNumber)?.int64Value ?? 0
             let totalFiles = args["totalFiles"] as? Int ?? 1
             let currentIndex = args["currentIndex"] as? Int ?? 1
+            // Exact file size from the pod's file list; completes the download.
+            let expectedBytes = (args["expectedBytes"] as? NSNumber)?.intValue ?? 0
 
-            bleCore.downloadFile(filename: filename, start: start, end: end, totalFiles: totalFiles, currentIndex: currentIndex)
+            bleCore.downloadFile(filename: filename, start: start, end: end, totalFiles: totalFiles,
+                                 currentIndex: currentIndex, expectedBytes: expectedBytes)
             result(nil)
 
         case "cancelDownload":

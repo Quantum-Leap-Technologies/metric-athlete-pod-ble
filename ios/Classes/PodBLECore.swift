@@ -20,8 +20,6 @@ class PodBLECore: NSObject {
 
     private let scanDurationSeconds: TimeInterval = 15
     private let watchdogTimeoutSeconds: TimeInterval = 60
-    private let stuckThresholdSeconds: TimeInterval = 5.0
-    private let stuckProgressThreshold: Double = 0.98
     /// How long to wait after a download request for the file header before
     /// failing the attempt. The watchdog above only arms once a header has been
     /// accepted, so without this a pod that never answers left the app on
@@ -47,8 +45,11 @@ class PodBLECore: NSObject {
     // Packet reassembly
     private var payloadBuffer = Data()
     private var receivedPacketCount = 0
-    private var totalExpectedPackets = 0
-    private var actualPacketSize = 0
+    /// Payload bytes of the current file received so far.
+    private var receivedBytes = 0
+    /// Exact size of the file being downloaded, from the pod's file list (0 when
+    /// unknown). The download is complete when this many payload bytes arrive.
+    private var expectedBytes = 0
     private var currentMessageType: UInt8 = 0
 
     // File list (0x02) reassembly — pod may fragment across multiple BLE notifications
@@ -215,9 +216,10 @@ class PodBLECore: NSObject {
 
     // MARK: - Download
 
-    func downloadFile(filename: String, start: Int64, end: Int64, totalFiles: Int, currentIndex: Int) {
+    func downloadFile(filename: String, start: Int64, end: Int64, totalFiles: Int, currentIndex: Int, expectedBytes: Int = 0) {
         stopWatchdog()
         resetDownloadState()
+        self.expectedBytes = max(0, expectedBytes)
 
         totalFilesInPack = totalFiles
         currentFileIndex = currentIndex
@@ -232,8 +234,8 @@ class PodBLECore: NSObject {
         isDownloadActive = true
         downloadGeneration += 1
 
-        NSLog("[PodBLE] downloadFile — file='%@' (%d/%d), filter=%@, range=[%lld..%lld]",
-              cleanName, currentIndex, totalFiles,
+        NSLog("[PodBLE] downloadFile — file='%@' (%d/%d), expectedBytes=%d, filter=%@, range=[%lld..%lld]",
+              cleanName, currentIndex, totalFiles, self.expectedBytes,
               isFiltering ? "ON" : "OFF", start, end)
 
         // Request background execution time so iOS doesn't suspend us mid-download
@@ -277,8 +279,8 @@ class PodBLECore: NSObject {
     }
 
     func cancelDownload() {
-        NSLog("[PodBLE] cancelDownload — received=%d/%d packets, buffer=%d bytes",
-              receivedPacketCount, totalExpectedPackets, payloadBuffer.count)
+        NSLog("[PodBLE] cancelDownload — received=%d/%d bytes in %d frames",
+              receivedBytes, expectedBytes, receivedPacketCount)
         stopWatchdog()
         writeCommand(Data([0x08]))
 
@@ -301,92 +303,68 @@ class PodBLECore: NSObject {
 
     // MARK: - Packet Reassembly
 
-    private func processPacket(_ packet: Data) {
-        guard packet.count >= 5 else {
-            NSLog("[PodBLE] processPacket — DROPPED: too short (%d bytes)", packet.count)
-            return
-        }
+    // Every notification from the pod is one frame: [0xAE][type][length][payload]
+    // (BLE ICD V3.6). For a file download (type 0x03) the payloads are consecutive
+    // raw records, continuing from the previous frame. There is NO packet-count
+    // header: an earlier version read bytes 4-7 of the first packet as a count, but
+    // those are record data (e.g. EA 07 = the year 2026), and it stripped 5 bytes
+    // per frame instead of 3, dropping real data. The download is complete when the
+    // file list's exact size has arrived. Same as Android since METRICAT-40.
 
-        // Strip 0xAE header from pod responses (ICD V3.6)
-        let data: Data
-        if packet.count >= 2 && packet[0] == 0xAE {
-            data = packet.subdata(in: 1..<packet.count)
-        } else {
-            data = packet
-        }
+    private static let frameByte: UInt8 = 0xAE
+    private static let fileDataType: UInt8 = 0x03
+    private static let frameOverhead = 3
+
+    /// The payload of one frame, or nil if the notification isn't a frame. A length
+    /// byte larger than what arrived (a truncated notification) yields what is there.
+    private static func parseFrame(_ packet: Data) -> (type: UInt8, payload: Data)? {
+        guard packet.count >= frameOverhead, packet[packet.startIndex] == frameByte else { return nil }
+        let base = packet.startIndex
+        let type = packet[base + 1]
+        let length = Int(packet[base + 2])
+        let available = packet.count - frameOverhead
+        let count = min(length, available)
+        return (type, packet.subdata(in: (base + frameOverhead)..<(base + frameOverhead + count)))
+    }
+
+    /// Appends one file-data frame. Runs on processingQueue.
+    private func processFrame(type: UInt8, payload: Data) {
+        // Frames still queued when the download finished or was aborted belong to
+        // that download; never start a new file from them.
+        guard isDownloadActive else { return }
 
         if receivedPacketCount == 0 {
-            // First packet (header)
-            guard data.count >= 8 else {
-                NSLog("[PodBLE] processPacket — DROPPED first packet: too short for header (%d bytes after 0xAE strip)", data.count)
-                return
-            }
-
-            let type = data[0]
             currentMessageType = type
-
-            // Read total expected packets (bytes 4-7 of stripped data, little endian)
-            totalExpectedPackets = Int(data.subdata(in: 4..<8).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
-            })
-
-            NSLog("[PodBLE] processPacket — HEADER: type=0x%02X, expectedPackets=%d, dataSize=%d",
-                  type, totalExpectedPackets, data.count)
-
-            // Sanity check — reject obviously corrupt headers.
-            let maxReasonablePackets = 500_000
-            guard totalExpectedPackets > 0 && totalExpectedPackets <= maxReasonablePackets else {
-                NSLog("[PodBLE] processPacket — REJECTED: unreasonable packet count %d (max=%d)", totalExpectedPackets, maxReasonablePackets)
-                totalExpectedPackets = 0
-                return
-            }
-
-            // Pre-allocate buffer
-            let safePacketSize = max(actualPacketSize, 64)
-            let estimatedSize = totalExpectedPackets * (safePacketSize - 5) + 2048
-            payloadBuffer = Data(capacity: estimatedSize)
-
-            payloadBuffer.append(currentMessageType)
-
-            if data.count > 8 {
-                payloadBuffer.append(data.subdata(in: 8..<data.count))
-            }
-            receivedPacketCount = 1
-
-        } else {
-            // Subsequent packet — strip 5-byte BLE framing header
-            if data.count > 4 {
-                payloadBuffer.append(data.subdata(in: 4..<data.count))
-            }
-            receivedPacketCount += 1
+            let capacity = expectedBytes > 0 ? min(expectedBytes + 2048, Int.max / 2) : (1 << 20)
+            payloadBuffer = Data(capacity: capacity)
+            // The Dart side dispatches on the first byte: the message type.
+            payloadBuffer.append(type)
+            NSLog("[PodBLE] processFrame — first data frame: type=0x%02X, payload=%d bytes, expectedBytes=%d",
+                  type, payload.count, expectedBytes)
         }
-
-        // Auto-detect packet size from first packet
-        if actualPacketSize == 0 {
-            actualPacketSize = packet.count // Use raw packet size for MTU detection
-        }
+        payloadBuffer.append(payload)
+        receivedBytes += payload.count
+        receivedPacketCount += 1
 
         // Smart Peek
         if isFiltering && currentMessageType == 0x03 && !isSmartPeekDone && payloadBuffer.count >= 129 {
             performSmartPeek()
             isSmartPeekDone = true
+            guard isDownloadActive else { return } // filtered out
         }
 
         // Report download progress to Flutter
-        if totalExpectedPackets > 0 && receivedPacketCount > 0 {
-            let pct = min(Int((Double(receivedPacketCount) / Double(totalExpectedPackets)) * 100), 100)
-            if pct != lastReportedProgress && (pct == 1 || pct % 5 == 0 || receivedPacketCount >= totalExpectedPackets) {
+        if expectedBytes > 0 {
+            let pct = min(Int(Double(receivedBytes) / Double(expectedBytes) * 100), 100)
+            if pct != lastReportedProgress && (pct == 1 || pct % 5 == 0 || receivedBytes >= expectedBytes) {
                 lastReportedProgress = pct
                 delegate?.didUpdateStatus("Downloading \(pct)%")
             }
         }
 
-        // Completion check
-        if totalExpectedPackets > 0 && receivedPacketCount >= totalExpectedPackets {
-            // Small grace period
-            bleQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.finishMessage()
-            }
+        // Complete as soon as the file's declared size has arrived.
+        if expectedBytes > 0 && receivedBytes >= expectedBytes {
+            finishMessage()
         }
     }
 
@@ -455,8 +433,12 @@ class PodBLECore: NSObject {
         let t2 = Int(peekData.subdata(in: recordSize..<(recordSize + 4)).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
         let rawInterval = Int64(t2 - t1)
         let interval = snapToStandardInterval(rawInterval)
-        let payloadPerPacket = Int64(max(actualPacketSize - 5, 59))
-        let dur = (Int64(totalExpectedPackets) * payloadPerPacket / Int64(recordSize)) * interval
+        // Without the file size we can't estimate the duration, so don't filter.
+        guard expectedBytes > 0 else {
+            NSLog("[PodBLE] smartPeek — file size unknown, not filtering")
+            return
+        }
+        let dur = (Int64(expectedBytes) / Int64(recordSize)) * interval
 
         NSLog("[PodBLE] smartPeek — fileDate=%d-%02d-%02d %02d:%02d:%02d, recordSize=%d, interval=%lldms (raw=%lld), estDuration=%lldms",
               yr, mon, day, hr, min, sec, recordSize, interval, rawInterval, dur)
@@ -475,21 +457,29 @@ class PodBLECore: NSObject {
     // MARK: - Message Completion
 
     private func finishMessage() {
+        guard isDownloadActive else { return }
         stopWatchdog()
         stopKeepalive()
         endBackgroundDownload()
+        isDownloadActive = false
+        downloadRequestedAt = nil
 
-        NSLog("[PodBLE] finishMessage — type=0x%02X, received=%d/%d packets, buffer=%d bytes",
-              currentMessageType, receivedPacketCount, totalExpectedPackets, payloadBuffer.count)
+        // 1 type byte + payload. Never deliver more than the file holds.
+        var finalData = payloadBuffer
+        if expectedBytes > 0 && finalData.count - 1 > expectedBytes {
+            finalData = finalData.prefix(expectedBytes + 1)
+        }
+        NSLog("[PodBLE] finishMessage — type=0x%02X, %d bytes (expected %d), %d frames",
+              currentMessageType, finalData.count - 1, expectedBytes, receivedPacketCount)
 
-        let finalData = payloadBuffer
         DispatchQueue.main.async { [weak self] in
             self?.delegate?.didReceivePayload(finalData)
         }
 
         // Reset for next file
         receivedPacketCount = 0
-        totalExpectedPackets = 0
+        receivedBytes = 0
+        expectedBytes = 0
         payloadBuffer = Data()
     }
 
@@ -512,38 +502,35 @@ class PodBLECore: NSObject {
     }
 
     private func watchdogTick() {
+        guard isDownloadActive else { return }
         let elapsed = Date().timeIntervalSince(lastPacketTime)
 
-        // No file header accepted yet: either the pod never answered, or every
-        // first packet was rejected as a header. Fail the attempt so the app's
-        // retry loop can resend the request.
-        if isDownloadActive && totalExpectedPackets == 0,
-           let requestedAt = downloadRequestedAt {
+        // No file data yet: the pod never answered the request. Fail the attempt
+        // so the app's retry loop can resend it, instead of waiting out the
+        // 45-minute Dart timeout (METRICAT-115).
+        if receivedPacketCount == 0, let requestedAt = downloadRequestedAt {
             let waited = Date().timeIntervalSince(requestedAt)
             if waited > firstPacketTimeoutSeconds {
-                NSLog("[PodBLE] watchdog — NO HEADER %.1fs after request (packets seen since: %@), failing attempt",
-                      waited, lastPacketTime > requestedAt ? "YES" : "NO")
-                abortDownload(reason: "no header after \(Int(waited))s")
+                NSLog("[PodBLE] watchdog — NO DATA %.1fs after request, failing attempt", waited)
+                abortDownload(reason: "no data after \(Int(waited))s")
                 delegate?.didUpdateStatus("Download Failed: No response from pod")
-                return
             }
-        }
-
-        // Hard timeout
-        if totalExpectedPackets > 0 && elapsed > watchdogTimeoutSeconds {
-            NSLog("[PodBLE] watchdog — HARD TIMEOUT after %.1fs, received=%d/%d packets", elapsed, receivedPacketCount, totalExpectedPackets)
-            finishMessage()
             return
         }
 
-        // Stuck at 99% check
-        if totalExpectedPackets > 0 && elapsed > stuckThresholdSeconds {
-            let progress = Double(receivedPacketCount) / Double(totalExpectedPackets)
-            if progress > stuckProgressThreshold {
-                NSLog("[PodBLE] watchdog — STUCK at %.1f%% for %.1fs, forcing finish", progress * 100, elapsed)
-                finishMessage()
-                return
-            }
+        // Data stopped for 60s mid-download: the link is dead and what we have is a
+        // partial file. Never deliver it as finished — fail and disconnect (Android).
+        if elapsed > watchdogTimeoutSeconds {
+            NSLog("[PodBLE] watchdog — no data for %.0fs at %d/%d bytes, discarding the partial download",
+                  elapsed, receivedBytes, expectedBytes)
+            failDownloadAndDisconnect("Download timed out")
+            return
+        }
+
+        // Size unknown (no file-list entry): treat a quiet gap after data as the end.
+        if expectedBytes == 0 && elapsed > 5 {
+            NSLog("[PodBLE] watchdog — size unknown, no data for 5s after %d bytes, finishing", receivedBytes)
+            finishMessage()
         }
     }
 
@@ -583,19 +570,29 @@ class PodBLECore: NSObject {
     /// app can fail it and retry. Doesn't message the pod: the app's retry calls
     /// cancelDownload(), which sends the stop command (0x08) before resending.
     private func abortDownload(reason: String) {
-        NSLog("[PodBLE] abortDownload — %@, received=%d/%d packets", reason, receivedPacketCount, totalExpectedPackets)
+        NSLog("[PodBLE] abortDownload — %@, received=%d/%d bytes", reason, receivedBytes, expectedBytes)
         stopWatchdog()
         stopKeepalive()
         endBackgroundDownload()
         resetDownloadState()
     }
 
+    /// The download can't finish (dead link, or the stream lost its framing):
+    /// discard the partial file, tell the app the connection is gone and
+    /// disconnect, so the sync fails instead of saving half a file. Same as
+    /// Android's failDownload (METRICAT-92).
+    private func failDownloadAndDisconnect(_ reason: String) {
+        abortDownload(reason: reason)
+        delegate?.didUpdateStatus("Disconnected: \(reason)")
+        disconnect()
+    }
+
     private func resetDownloadState() {
         isDownloadActive = false
         downloadRequestedAt = nil
         receivedPacketCount = 0
-        totalExpectedPackets = 0
-        actualPacketSize = 0
+        receivedBytes = 0
+        expectedBytes = 0
         isSmartPeekDone = false
         lastReportedProgress = -1
         payloadBuffer = Data()
@@ -797,34 +794,51 @@ extension PodBLECore: CBPeripheralDelegate {
         let hex = data.prefix(20).map { String(format: "%02X", $0) }.joined(separator: " ")
         NSLog("[PodBLE] didUpdateValue — received %d bytes: [%@%@]", data.count, hex, data.count > 20 ? "..." : "")
 
-        lastPacketTime = Date()
-
-        // Route packets: download reassembly vs direct passthrough
-        if isDownloadActive || totalExpectedPackets > 0 || receivedPacketCount > 0 {
-            // Active download — route through processing queue to avoid blocking BLE thread
-            let packetCopy = Data(data)
-            processingQueue.async { [weak self] in
-                self?.processPacket(packetCopy)
+        // Route packets during a download (same as Android's PacketFraming.route):
+        //  - a file-data frame (0xAE 0x03 ...) → reassembly
+        //  - not a frame at all → the stream lost its framing; these aren't file
+        //    bytes we can place. Never forward them to Flutter, where the first byte
+        //    would be read as a message type. Cancel and fail the download.
+        //  - any other frame (status, settings, ...) → Flutter, as below
+        if isDownloadActive {
+            guard let frame = PodBLECore.parseFrame(data) else {
+                let head = data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+                NSLog("[PodBLE] didUpdateValue — unframed packet during download (%d bytes) at %d/%d bytes, first bytes: %@. Cancelling.",
+                      data.count, receivedBytes, expectedBytes, head)
+                writeCommand(Data([0x08])) // the pod keeps sending otherwise
+                failDownloadAndDisconnect("Download lost framing")
+                return
             }
-        } else {
-            // Check for file list (0x02) that may need reassembly
-            let stripped: Data
-            if data.count >= 2 && data[0] == 0xAE {
-                stripped = data.subdata(in: 1..<data.count)
-            } else {
-                stripped = data
-            }
-
-            if stripped.count >= 3 && stripped[0] == 0x02 {
-                processFileListPacket(stripped)
-            } else if isFileListReassemblyActive && stripped.count > 0 && stripped[0] != 0x01 {
-                // Continuation fragment without 0x02 type — append raw data
-                processFileListPacket(stripped)
-            } else {
-                // Not a file list — pass through directly (live telemetry, settings, etc.)
-                DispatchQueue.main.async { [weak self] in
-                    self?.delegate?.didReceivePayload(data)
+            if frame.type == PodBLECore.fileDataType {
+                // Only file data counts as progress for the watchdog.
+                lastPacketTime = Date()
+                let payload = frame.payload
+                let type = frame.type
+                processingQueue.async { [weak self] in
+                    self?.processFrame(type: type, payload: payload)
                 }
+                return
+            }
+        }
+
+        // Not a download frame: file list, settings, live telemetry, ...
+        // Check for file list (0x02) that may need reassembly
+        let stripped: Data
+        if data.count >= 2 && data[0] == 0xAE {
+            stripped = data.subdata(in: 1..<data.count)
+        } else {
+            stripped = data
+        }
+
+        if stripped.count >= 3 && stripped[0] == 0x02 {
+            processFileListPacket(stripped)
+        } else if isFileListReassemblyActive && stripped.count > 0 && stripped[0] != 0x01 {
+            // Continuation fragment without 0x02 type — append raw data
+            processFileListPacket(stripped)
+        } else {
+            // Not a file list — pass through directly (live telemetry, settings, etc.)
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.didReceivePayload(data)
             }
         }
     }

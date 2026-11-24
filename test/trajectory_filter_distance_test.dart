@@ -186,6 +186,44 @@ void main() {
       }
     });
 
+    test('a bad first fix is dropped without a bridging jump', () {
+      final base = _walk(seconds: 120);
+      for (final badRecords in [10, 20]) {
+        final glitched = walkWithFixes(
+          base,
+          0,
+          badRecords,
+          (log) => log.copyWith(
+            latitude: log.latitude + 500.0 / _metersPerDegreeLat,
+          ),
+        );
+        final truth = 2.0 * (base.length - badRecords) / 10.0;
+        expect(
+          _trackMeters(TrajectoryFilter.process(glitched).logs),
+          closeTo(truth, truth * 0.03),
+          reason: '$badRecords bad records at the start',
+        );
+      }
+    });
+
+    test('a burst of wrong fixes in a steady run adds only the true track', () {
+      final base = _walk(seconds: 180);
+      final clean = cleanTrack(base);
+      // 20 s, 266 m off, then the pod is back on the track.
+      final glitched = walkWithFixes(
+        base,
+        600,
+        800,
+        (log) => log.copyWith(
+          latitude: log.latitude + 266.0 / _metersPerDegreeLat,
+        ),
+      );
+      expect(
+        _trackMeters(TrajectoryFilter.process(glitched).logs),
+        closeTo(clean, 5.0),
+      );
+    });
+
     test('a (0,0) or out-of-range coordinate adds no jump', () {
       final base = _walk(seconds: 60);
       final clean = cleanTrack(base);

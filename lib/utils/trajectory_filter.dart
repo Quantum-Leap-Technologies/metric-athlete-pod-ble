@@ -435,41 +435,87 @@ class TrajectoryFilter {
   /// the last *change* lets a GPS reading that stalled for seconds and then
   /// catches up pass, while a position that teleports away and back does not.
   /// The record itself is kept so its IMU data survives.
+  ///
+  /// Rejected fixes that agree with each other form a candidate track. If it
+  /// outlives the track accepted so far, that track was the glitch (a bad
+  /// first fix): its records are re-pointed at the candidate's first position
+  /// so no bridging jump is left in the path.
   static List<SensorLog> _holdImplausibleFixes(
     List<SensorLog> logs,
     int kernelStepSize,
     double maxSpeedMs,
   ) {
     if (logs.length < 2) return logs;
-    final held = <SensorLog>[logs.first];
-    var refLat = logs.first.latitude;
-    var refLon = logs.first.longitude;
-    var refPacketId = logs.first.packetId;
+    bool reachable(SensorLog from, SensorLog to) {
+      final seconds =
+          (to.packetId - from.packetId) / kernelStepSize * _secondsPerStep;
+      return _haversineMeters(
+            from.latitude,
+            from.longitude,
+            to.latitude,
+            to.longitude,
+          ) <=
+          maxSpeedMs * seconds;
+    }
+
+    bool samePosition(SensorLog a, SensorLog b) =>
+        a.latitude == b.latitude && a.longitude == b.longitude;
+
+    final lats = [for (final log in logs) log.latitude];
+    final lons = [for (final log in logs) log.longitude];
+    var accepted = logs.first;
+    var acceptedStart = 0;
+    var acceptedStartTick = logs.first.packetId;
+    int? candidateStart;
+    late SensorLog candidateFirst;
+    late SensorLog candidateLast;
 
     for (int i = 1; i < logs.length; i++) {
       final log = logs[i];
-      if (log.latitude == refLat && log.longitude == refLon) {
-        held.add(log);
+      if (samePosition(log, accepted)) {
         continue;
       }
-      final seconds =
-          (log.packetId - refPacketId) / kernelStepSize * _secondsPerStep;
-      final meters = _haversineMeters(
-        refLat,
-        refLon,
-        log.latitude,
-        log.longitude,
-      );
-      if (meters <= maxSpeedMs * seconds) {
-        refLat = log.latitude;
-        refLon = log.longitude;
-        refPacketId = log.packetId;
-        held.add(log);
+      if (reachable(accepted, log)) {
+        accepted = log;
+        candidateStart = null;
+        continue;
+      }
+
+      lats[i] = accepted.latitude;
+      lons[i] = accepted.longitude;
+      if (candidateStart != null &&
+          (samePosition(log, candidateLast) || reachable(candidateLast, log))) {
+        candidateLast = log;
       } else {
-        held.add(log.copyWith(latitude: refLat, longitude: refLon));
+        candidateStart = i;
+        candidateFirst = log;
+        candidateLast = log;
+      }
+
+      final candidateAge = log.packetId - candidateFirst.packetId;
+      final acceptedAge = candidateFirst.packetId - acceptedStartTick;
+      if (candidateAge > acceptedAge) {
+        for (int j = acceptedStart; j < candidateStart; j++) {
+          lats[j] = candidateFirst.latitude;
+          lons[j] = candidateFirst.longitude;
+        }
+        for (int j = candidateStart; j <= i; j++) {
+          lats[j] = logs[j].latitude;
+          lons[j] = logs[j].longitude;
+        }
+        accepted = log;
+        acceptedStart = candidateStart;
+        acceptedStartTick = candidateFirst.packetId;
+        candidateStart = null;
       }
     }
-    return held;
+
+    return [
+      for (int i = 0; i < logs.length; i++)
+        lats[i] == logs[i].latitude && lons[i] == logs[i].longitude
+            ? logs[i]
+            : logs[i].copyWith(latitude: lats[i], longitude: lons[i]),
+    ];
   }
 
   static double _haversineMeters(

@@ -207,18 +207,25 @@ class TrajectoryFilter {
       }
     }
 
+    // 2b. Hold implausible raw fixes (see _holdImplausibleFixes).
+    final List<SensorLog> gatedLogs = _holdImplausibleFixes(
+      dedupedLogs,
+      kernelStepSize,
+      config.physicsSpeedLimit / 3.6,
+    );
+
     // 3. The Repair Loop
     // We iterate through the logs. If we see a jump in PacketID, we fill it.
     final List<SensorLog> repairedLogs = [];
     int repairedCount = 0; // NEW: Track how many packets we had to fake.
 
     // Anchor: Start with the first clean log
-    DateTime currentTime = dedupedLogs.first.timestamp;
-    repairedLogs.add(dedupedLogs.first.copyWith(timestamp: currentTime));
+    DateTime currentTime = gatedLogs.first.timestamp;
+    repairedLogs.add(gatedLogs.first.copyWith(timestamp: currentTime));
 
-    for (int i = 1; i < dedupedLogs.length; i++) {
-      final prev = dedupedLogs[i - 1];
-      final curr = dedupedLogs[i];
+    for (int i = 1; i < gatedLogs.length; i++) {
+      final prev = gatedLogs[i - 1];
+      final curr = gatedLogs[i];
 
       // Calculate how many "steps" the hardware skipped.
       // E.g., if IDs are 100 and 300, and step is 100, we missed 1 step (ID 200).
@@ -361,14 +368,20 @@ class TrajectoryFilter {
       }
     }
 
+    final gatedLogs = _holdImplausibleFixes(
+      dedupedLogs,
+      kernelStepSize,
+      config.physicsSpeedLimit / 3.6,
+    );
+
     final repairedLogs = <SensorLog>[];
     int repairedCount = 0;
-    DateTime currentTime = dedupedLogs.first.timestamp;
-    repairedLogs.add(dedupedLogs.first.copyWith(timestamp: currentTime));
+    DateTime currentTime = gatedLogs.first.timestamp;
+    repairedLogs.add(gatedLogs.first.copyWith(timestamp: currentTime));
 
-    for (int i = 1; i < dedupedLogs.length; i++) {
-      final prev = dedupedLogs[i - 1];
-      final curr = dedupedLogs[i];
+    for (int i = 1; i < gatedLogs.length; i++) {
+      final prev = gatedLogs[i - 1];
+      final curr = gatedLogs[i];
       int idDiff = curr.packetId - prev.packetId;
       int steps = (idDiff / kernelStepSize).round();
 
@@ -411,6 +424,72 @@ class TrajectoryFilter {
     );
   }
 
+  /// Seconds the hardware clock advances per kernel step (Stage 0 re-timing).
+  static const double _secondsPerStep = 0.1;
+
+  /// GPS GLITCH GATE
+  /// Replaces a raw position with the last accepted one when reaching it would
+  /// need more than [maxSpeedMs] over the time since that accepted position
+  /// first appeared. Time comes from the kernel tick (`packetId`), because
+  /// timestamps repeat or have 1 s resolution on some firmware. Measuring from
+  /// the last *change* lets a GPS reading that stalled for seconds and then
+  /// catches up pass, while a position that teleports away and back does not.
+  /// The record itself is kept so its IMU data survives.
+  static List<SensorLog> _holdImplausibleFixes(
+    List<SensorLog> logs,
+    int kernelStepSize,
+    double maxSpeedMs,
+  ) {
+    if (logs.length < 2) return logs;
+    final held = <SensorLog>[logs.first];
+    var refLat = logs.first.latitude;
+    var refLon = logs.first.longitude;
+    var refPacketId = logs.first.packetId;
+
+    for (int i = 1; i < logs.length; i++) {
+      final log = logs[i];
+      if (log.latitude == refLat && log.longitude == refLon) {
+        held.add(log);
+        continue;
+      }
+      final seconds =
+          (log.packetId - refPacketId) / kernelStepSize * _secondsPerStep;
+      final meters = _haversineMeters(
+        refLat,
+        refLon,
+        log.latitude,
+        log.longitude,
+      );
+      if (meters <= maxSpeedMs * seconds) {
+        refLat = log.latitude;
+        refLon = log.longitude;
+        refPacketId = log.packetId;
+        held.add(log);
+      } else {
+        held.add(log.copyWith(latitude: refLat, longitude: refLon));
+      }
+    }
+    return held;
+  }
+
+  static double _haversineMeters(
+    double lat1,
+    double lon1,
+    double lat2,
+    double lon2,
+  ) {
+    const earthRadiusM = 6371000.0;
+    final dLat = (lat2 - lat1) * pi / 180;
+    final dLon = (lon2 - lon1) * pi / 180;
+    final a =
+        sin(dLat / 2) * sin(dLat / 2) +
+        cos(lat1 * pi / 180) *
+            cos(lat2 * pi / 180) *
+            sin(dLon / 2) *
+            sin(dLon / 2);
+    return earthRadiusM * 2 * atan2(sqrt(a), sqrt(1 - a));
+  }
+
   /// VALIDATION LOGIC
   /// Returns 'false' if the packet contains corrupted or physically impossible data.
   /// Used in Stage -1 to filter out "gibberish" before processing.
@@ -424,6 +503,9 @@ class TrajectoryFilter {
     // 2. Check for "Null Island"
     // Lat/Lon of 0.0 is the default "No Fix" state for GPS.
     if (log.latitude.abs() < 0.001 && log.longitude.abs() < 0.001) return false;
+
+    // Out-of-range (or NaN) coordinates are corruption, not a position.
+    if (!(log.latitude.abs() <= 90 && log.longitude.abs() <= 180)) return false;
 
     // 3. PHYSICAL LIMITS CHECK (Tuned to hardware capabilities)
 
@@ -526,8 +608,6 @@ class _HybridTrajectoryPipeline {
   bool _hasStartedMoving = false;
   int _sustainedMotionCounter = 0;
 
-  final List<SensorLog> _provisionalBuffer = [];
-
   // Helper to run one predict/update cycle for both Lat and Lon
   (double, double) _runFilterStep(double lat, double lon, bool isStationary) {
     if (isStationary) {
@@ -564,7 +644,6 @@ class _HybridTrajectoryPipeline {
     _kfLon = null;
     _hasStartedMoving = false;
     _sustainedMotionCounter = 0;
-    _provisionalBuffer.clear();
 
     final varCalc = _VarianceCalculator(windowSize: 10);
     final speedSmoother = _SpeedSmoother(windowSize: 5);
@@ -606,45 +685,23 @@ class _HybridTrajectoryPipeline {
               : (currentVariance > _config.stationaryVarThreshold &&
                   smoothedSpeed > _config.movingSpeedThreshold);
 
-      // Motion Latch Logic (prevents drift when standing still at start)
+      // Motion latch: until sustained motion is seen, the stricter test above
+      // decides. Frames before it are still filtered (stationary mode), never
+      // dropped, so slow real movement at the start is kept.
       if (!_hasStartedMoving) {
-        if (!isActiveMotion) {
-          _sustainedMotionCounter = 0;
-          _provisionalBuffer.clear();
-        } else {
-          _sustainedMotionCounter++;
-          _provisionalBuffer.add(log);
-          if (_sustainedMotionCounter >= _config.requiredSustainedFrames) {
-            _hasStartedMoving = true;
-            // Align filter to start of movement
-            _kfLat!.x = _provisionalBuffer.first.latitude;
-            _kfLon!.x = _provisionalBuffer.first.longitude;
-            _kfLat!.clearHistory();
-            _kfLon!.clearHistory();
-
-            // Process buffered logs
-            for (var bufLog in _provisionalBuffer) {
-              var (fLat, fLon) = _runFilterStep(
-                bufLog.latitude,
-                bufLog.longitude,
-                false,
-              );
-              forwardResults.add(
-                _InternalPassData(fLat, fLon, bufLog.speed, bufLog),
-              );
-            }
-            _provisionalBuffer.clear();
-          }
+        _sustainedMotionCounter =
+            isActiveMotion ? _sustainedMotionCounter + 1 : 0;
+        if (_sustainedMotionCounter >= _config.requiredSustainedFrames) {
+          _hasStartedMoving = true;
         }
-      } else {
-        // Normal processing once moving
-        var (fLat, fLon) = _runFilterStep(
-          log.latitude,
-          log.longitude,
-          !isActiveMotion,
-        );
-        forwardResults.add(_InternalPassData(fLat, fLon, smoothedSpeed, log));
       }
+
+      var (fLat, fLon) = _runFilterStep(
+        log.latitude,
+        log.longitude,
+        !isActiveMotion,
+      );
+      forwardResults.add(_InternalPassData(fLat, fLon, smoothedSpeed, log));
     }
 
     if (_kfLat == null || forwardResults.isEmpty) return [];
@@ -659,17 +716,11 @@ class _HybridTrajectoryPipeline {
       double lat = rtsLats[i];
       double lon = rtsLons[i];
       var passData = forwardResults[i];
-      double finalSpeed = passData.smoothedSpeed;
-
-      // Force 0 speed if position is identical to previous frame
-      if (i > 0 && lat == rtsLats[i - 1] && lon == rtsLons[i - 1])
-        finalSpeed = 0.0;
-
       finalLogs.add(
         passData.originalLog.copyWith(
           latitude: lat,
           longitude: lon,
-          speed: finalSpeed,
+          speed: passData.smoothedSpeed,
         ),
       );
     }
@@ -713,8 +764,6 @@ class _KalmanFilter1D {
     q = qVal;
     r = rVal;
   }
-
-  void clearHistory() => _history.clear();
 
   List<double> rtsSmooth() {
     int n = _history.length;

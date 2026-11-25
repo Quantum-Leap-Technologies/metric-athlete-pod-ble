@@ -17,6 +17,24 @@ void main() {
       );
     });
 
+    // --- Type 0x03: File download ---
+
+    test('type 0x03 carries the exact downloaded bytes', () {
+      final file = Uint8List.fromList(List<int>.filled(243, 7));
+
+      handler.handleMessage(0x03, file);
+
+      expect(messages.single.type, 0x03);
+      expect(messages.single.rawFileBytes, orderedEquals(file));
+      expect(messages.single.payloadBytes, 243);
+    });
+
+    test('messages other than a download carry no file bytes', () {
+      handler.handleMessage(0xda, Uint8List(0));
+
+      expect(messages.single.rawFileBytes, isNull);
+    });
+
     // --- Type 0x01: Live Telemetry ---
 
     test('type 0x01 parses valid 72-byte telemetry', () {

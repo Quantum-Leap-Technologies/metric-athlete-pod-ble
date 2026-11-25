@@ -1,3 +1,8 @@
+## 0.0.18
+
+### Added
+* **Original file bytes (METRICAT-203):** `PodNotifier.lastRawBytes` holds the exact bytes of the last completed download, set together with `lastRawLogs`. It is null for a stray 0x03, a size mismatch, a file that parses to 0 records, a skipped file, and from the moment the next download starts. `PodMessage` gains an optional `rawFileBytes`. Nothing else changes: filters, parsing and `PodState` are as before.
+
 ## 0.0.17
 
 ### Fixed

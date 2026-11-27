@@ -7,13 +7,21 @@ import 'package:metric_athlete_pod_ble/metric_athlete_pod_ble.dart';
 ///The [description] describes the current state or content of the message.
 ///The [payload] contains the data received in the message from the pod.
 ///The [payloadBytes] is the size of the raw bytes a file download (0x03) was parsed from, so the notifier can check it against the file's expected size.
+///The [rawFileBytes] are the exact bytes a successful file download (0x03) was parsed from. They are null on every other message, including "Parse Failed". An empty parse still carries them; the notifier decides whether they are kept.
 ///The [podNotifier] uses the [type],[description] and [payload] data type to determine what models and states to update.
 class PodMessage {
   final int type;
   final String description;
   final dynamic payload;
   final int? payloadBytes;
-  PodMessage(this.type, this.description, {this.payload, this.payloadBytes});
+  final Uint8List? rawFileBytes;
+  PodMessage(
+    this.type,
+    this.description, {
+    this.payload,
+    this.payloadBytes,
+    this.rawFileBytes,
+  });
 }
 
 ///This class is used to decode and process the different message types that is received from the pod through bluetooth.
@@ -147,6 +155,7 @@ class PodProtocolHandler {
           "Download Complete",
           payload: rawLogs,
           payloadBytes: rawBytes.length,
+          rawFileBytes: rawBytes,
         ),
       );
     } catch (e) {

@@ -88,6 +88,15 @@ class PodNotifier extends Notifier<PodState> {
   /// Kalman-filtered positions for distance.
   List<SensorLog>? lastRawLogs;
 
+  /// The exact bytes of the file behind [lastRawLogs], as the pod sent them.
+  ///
+  /// Set together with [lastRawLogs] for a download that passed the size check
+  /// and parsed to records; null in every other case and cleared when the next
+  /// download starts. An unmodifiable view of a private copy, so neither the
+  /// caller nor the decoder's buffer can change it. Kept outside [PodState] so
+  /// state copies never carry a multi-megabyte file.
+  Uint8List? lastRawBytes;
+
   @override
   PodState build() {
     _setupNativeListeners();
@@ -217,6 +226,10 @@ class PodNotifier extends Notifier<PodState> {
             // Store raw (pre-Kalman) logs for distance calculation.
             // Raw GPS positions give ~10% more accurate haversine distance.
             lastRawLogs = List.unmodifiable(rawLogs);
+            final rawFileBytes = msg.rawFileBytes;
+            lastRawBytes = rawFileBytes == null
+                ? null
+                : Uint8List.fromList(rawFileBytes).asUnmodifiableView();
 
             state = state.copyWith(statusMessage: "Processing Trajectory...");
 
@@ -1030,6 +1043,7 @@ class PodNotifier extends Notifier<PodState> {
       }
 
       _syncCompleter = Completer<List<SensorLog>>();
+      lastRawBytes = null;
       _downloadExpectedBytes = _fileSizes[fileInfo.split('(')[0].trim()];
       state = state.copyWith(
         downloadedFileBytes: null,
